@@ -1,0 +1,41 @@
+模块名：
+mod_auth_remote
+
+描述：
+通过简单的配置，远程api调用，来完成认证。
+实际情况中我们碰到这样的问题： 有N台服务器，需要限制只能被某些固定的ip访问。通常的方法就是在apache配置文件中写上某些ip列表。但是这些ip又是在变化的，我们不可能老是去更新N个服务器上的配置。 这些ip由某一个系统管理，并且可以通过某一URL发布出来。
+所以我们希望有一个模块，来完成这样的认证过程，通过实时获取URL中的ip信息，来确定目标ip是否可以访问。 我们的需求对于访问速度要求不高，所以尽管每次访问都会有一次http调用，但这是完全可接受的。 
+
+要求：
+Apache 2.x (tested with 2.2.15)
+
+安装：
+1.编辑makefile中的APCAEH_ROOT的值为Apache的路径。
+2.输入make，然后输入make install。
+3.更新Apache的配置文件。
+4.重启服务器。
+
+配置：
+支持以下指令：
+remote_order
+remote_allow
+remote_deny
+使用方法和与Apache原本的指令order，allow，deny分别对应，可兼容order，allow，deny支持的功能，唯一不同的是remote_allow和remote_deny增加了如下功能：
+remete_allow from url=url_name
+url_name是一个合法的url，提供一个ip地址列表。
+模块判断当前request的ip地址是否在url提供的ip列表中，如果在列表中，对remoet_allow来说表示允许访问，对remote_deny则表示不允许访问，实际最终判断结果要结合remote_order来判断。
+ip地址列表必须每行表示一个ip，格式与在allow from这种指令后面跟ip地址参数一样。ip地址格式写错时（比如空行）不匹配任何ip地址（效果等价于没写这一行）。
+
+例子：
+<Location /foo/bar>
+Remote_order deny,allow
+Remote_deny from all
+Remote_allow from url=http://manager.domain.com/access/list.txt
+Remote_allow from url=manager.domain.com:8080/xxx.txt
+</Location>
+list.txt中内容可以为
+192.168.2.111
+192.168.23.87
+xxx.txt内容为
+10.0.0.1
+那么只有ip地址为192.168.2.111，192.168.23.87和10.0.0.1的request被允许访问/foo/bar
