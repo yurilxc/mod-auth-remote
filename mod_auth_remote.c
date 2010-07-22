@@ -304,6 +304,20 @@ static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
     apr_pool_t *mp = r -> pool;
     server_rec *sr = r -> server;
     char errmsg_buf[120];
+
+        /* blank line is invalid in allow(deny) directive, but if it appears in the ip-list from url, it will incorectly match all ip in my module */
+    {
+        int i, len = strlen (mode);
+        for (i = 0; i < len; i++) /* it also exclude the situation when (strlen(mode) == 0) */
+            if (mode[i] != ' ') {
+                break;
+            }
+        if (i >= len) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "url is a blank line.");
+            return 0;
+        }
+    }
+    
     if (s = ap_strchr (mode, '/')) {
         *s++ = '\0';
         rv = apr_ipsubnet_create (&url_ip, mode, s, mp);
