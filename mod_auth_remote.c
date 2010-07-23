@@ -44,7 +44,8 @@
 #define DEBUG
 #include <stdio.h>
 #define BUFSIZE 255
-#define FILE_BUFSIZE (40 * 10000)
+#define FILE_BUFSIZE ((16 + 1) * (20000 + 10))
+//#define FILE_BUFSIZE (10)
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #define CRLF_STR "\r\n"
