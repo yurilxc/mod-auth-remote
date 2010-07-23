@@ -14,8 +14,10 @@ Apache 2.x (tested with 2.2.15)
 2.输入make，然后输入make install。
 3.更新Apache的配置文件。
 4.重启服务器。
+5.可以用make claen清除中间文件。
 
 配置：
+1.在httpd.conf中的配置指令：
 支持以下指令：
 remote_order
 remote_allow
@@ -24,8 +26,15 @@ remote_deny
 remete_allow from url=url_name
 url_name是一个合法的url，提供一个ip地址列表。
 模块判断当前request的ip地址是否在url提供的ip列表中，如果在列表中，对remoet_allow来说表示允许访问，对remote_deny则表示不允许访问，实际最终判断结果要结合remote_order来判断。
-ip地址列表必须每行表示一个ip，格式与在allow from这种指令后面跟ip地址参数一样。ip地址格式写错时（比如空行）不匹配任何ip地址（效果等价于没写这一行）。
-url格式错误或者地址错误时，不匹配任何ip地址(相当于没写这条指令)
+2.在url指向的配置文件中的ip：
+ip地址列表必须每行表示一个ip，格式与在allow from这种指令后面跟ip地址参数一样。
+
+注意：
+1.如果运行时发现有问题，在配置文件httpd.conf中把LogLevel参数改成info（详见Apache配置格式），日志中会输出一些可能有用的信息（可能是配置时url写错或者url指向的文件的ip地址格式有问题，或者是url指向的文件太大等等）。
+2.url格式错误或者地址错误时，不匹配任何ip地址(相当于没写这条指令)。
+3.ip地址格式写错时（比如空行）不匹配任何ip地址（效果等价于没写这一行）。
+4.尽量不要因为写错了格式也对结果没影响就写格式错误的指令，这样会令日志输出无用的信息，也可能会引起潜在的bug。
+5.url指向的ip地址列表大小不超过350000字节(假如每条ip地址约16字节，相当于约20000条ip地址)，如果大小超过限制，日志会输出提示信息。
 
 例子：
 <Location /foo/bar>

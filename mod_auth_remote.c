@@ -239,7 +239,7 @@ static int seperate_url (char *remote_url, char **hostname, apr_int64_t *p_port_
     p_tmp = ap_strchr (*hostname, '/');
     if (!p_tmp) {
         ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "%s", *hostname);
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "no filepath");
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "no filepath in url");
         return 0;
     }
     *filepath = apr_pstrdup (mp, p_tmp);
@@ -313,7 +313,7 @@ static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
                 break;
             }
         if (i >= len) {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "url is a blank line.");
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "url is a blank line.");
             return 0;
         }
     }
@@ -322,12 +322,12 @@ static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
         *s++ = '\0';
         rv = apr_ipsubnet_create (&url_ip, mode, s, mp);
         if (APR_STATUS_IS_EINVAL(rv)) {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "url looked nothing like an IP address!");
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "a directive in url is not a valid ip address.");
             return 0;
         }
         else if (rv != APR_SUCCESS) {
             apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "%s", errmsg_buf);
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
             return 0;
         }
      }
@@ -335,7 +335,7 @@ static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
         rv = apr_ipsubnet_create (&url_ip, mode, NULL, mp);
         if (rv != APR_SUCCESS) {
             apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "%s", errmsg_buf);
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
             return 0;
         }
     }
@@ -395,19 +395,19 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
     rv = apr_sockaddr_info_get(&sa, hostname, APR_INET, port, 0, mp);
     if (rv != APR_SUCCESS) {
         apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "%s", errmsg_buf);
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
         return 0;
     }
     rv = apr_socket_create(&s, sa->family, SOCK_STREAM, APR_PROTO_TCP, mp);
     if (rv != APR_SUCCESS) {
         apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "%s", errmsg_buf);
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
 	return 0;
     }
     rv = apr_socket_connect(s, sa);
     if (rv != APR_SUCCESS) {
         apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "%s", errmsg_buf);
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
         return 0;
     }
 
@@ -425,7 +425,7 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
     rv = apr_socket_send (s, req_msg, &len);
     if (rv != APR_SUCCESS) {
         apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "%s", errmsg_buf);
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
         return 0;
     }
 
@@ -440,7 +440,7 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
     while(1) {
         apr_size_t len = BUFSIZE;
         if (filebuf_cnt + len > FILE_BUFSIZE) {/* file too large */
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "the file from url is too large");
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the file from url is too large");
             return 0;
         }
         rv = apr_socket_recv (s, nfilebuf, &len);
@@ -471,7 +471,7 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
         if (t2)
             *t2 = '\0';
         if (!t1 && !t2) {       /* an unkonwn bug */
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "an unknown bug");
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "an unknown bug");
             return 0;
         }
         if (strlen (nfilebuf) == 0) { /* blank line */
@@ -510,7 +510,7 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
             nfilebuf = t2 + 1;
         }
         else  {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "an unknown bug");
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "an unknown bug");
             return 0;
         }
     }
