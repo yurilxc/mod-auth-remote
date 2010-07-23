@@ -25,6 +25,7 @@ remete_allow from url=url_name
 url_name是一个合法的url，提供一个ip地址列表。
 模块判断当前request的ip地址是否在url提供的ip列表中，如果在列表中，对remoet_allow来说表示允许访问，对remote_deny则表示不允许访问，实际最终判断结果要结合remote_order来判断。
 ip地址列表必须每行表示一个ip，格式与在allow from这种指令后面跟ip地址参数一样。ip地址格式写错时（比如空行）不匹配任何ip地址（效果等价于没写这一行）。
+url格式错误或者地址错误时，不匹配任何ip地址(相当于没写这条指令)
 
 例子：
 <Location /foo/bar>
