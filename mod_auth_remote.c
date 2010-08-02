@@ -50,6 +50,7 @@
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #define CRLF_STR "\r\n"
 #define DEF_SOCK_TIMEOUT (APR_USEC_PER_SEC * 4)
+#define DEF_EXPIRE_TIME (APR_USEC_PER_SEC * 4)
 
 enum allowdeny_type {
     T_ENV,
@@ -77,6 +78,8 @@ typedef struct {
 
 typedef struct {
     int order[METHODS];
+    apr_time_t last_update_time;/* modified */
+    apr_time_t expire_time;/* modified */
     apr_array_header_t *allows;
     apr_array_header_t *denys;
 } auth_remote_dir_conf;
@@ -95,6 +98,10 @@ static void *create_auth_remote_dir_config(apr_pool_t *p, char *dummy)
     conf->allows = apr_array_make(p, 1, sizeof(allowdeny));
     conf->denys = apr_array_make(p, 1, sizeof(allowdeny));
 
+    /* modified */
+    conf->last_update_time = 0;
+    conf->expire_time = DEF_EXPIRE_TIME;
+    
     return (void *)conf;
 }
 
@@ -119,6 +126,26 @@ static const char *order(cmd_parms *cmd, void *dv, const char *arg)
     return NULL;
 }
 
+/* modified */
+static const char *expire_time_cmd (cmd_parms *cmd, void *dv, const char *s_expire_time)
+{
+    auth_remote_dir_conf *d = (auth_remote_dir_conf *) dv;
+    int i, len = strlen (s_expire_time);
+    apr_time_t ttime = 0;
+    for (i = 0; i < len; i++) {
+        if (s_expire_time[i] <= '9' && s_expire_time[i] >= '0') {
+            ttime = ttime * 10 + (apr_time_t)(s_expire_time[i] - '0');
+        }
+        else {
+            return "not an integer";
+        }
+    }
+    for (i = 0; i < METHODS; i++)
+        if (cmd->limited & (AP_METHOD_BIT << i))
+            d->expire_time = apr_time_from_sec (ttime);
+    return NULL;
+}
+
 static const char *allow_cmd(cmd_parms *cmd, void *dv, const char *from,
                              const char *where_c)
 {
@@ -130,6 +157,7 @@ static const char *allow_cmd(cmd_parms *cmd, void *dv, const char *from,
     apr_status_t rv;
 
     if (strcasecmp(from, "from"))
+        
         return "allow and deny must be followed by 'from'";
 
     a = (allowdeny *) apr_array_push(cmd->info ? d->allows : d->denys);
@@ -187,6 +215,9 @@ static const command_rec auth_remote_cmds[] =
 {
     AP_INIT_TAKE1("remote_order", order, NULL, OR_LIMIT,
                   "'allow,deny', 'deny,allow', or 'mutual-failure'"),
+    /* modified */
+    AP_INIT_TAKE1("remote_expire_time", expire_time_cmd, NULL, OR_LIMIT,
+                  "an interger indicating seconds"),
     AP_INIT_ITERATE2("remote_allow", allow_cmd, &its_an_allow, OR_LIMIT,
                      "'from' followed by hostnames or IP-address wildcards or url"),
     AP_INIT_ITERATE2("remote_deny", allow_cmd, NULL, OR_LIMIT,
