@@ -344,11 +344,6 @@ static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "mode: %s\n", mode);
     #endif DEBUG
 
-     /* case T_IP: */
-     /*        if (apr_ipsubnet_test(ap[i].x.ip, r->connection->remote_addr)) { */
-     /*            return 1; */
-     /*        } */
-     /*        break; */
     if (apr_ipsubnet_test (url_ip, ip)) {
         return 1;
     }
@@ -356,6 +351,70 @@ static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "ip match failed!\n");
     #endif DEBUG
     return 0;
+}
+
+/* modified */
+static apr_status_t my_connection (apr_sockaddr_t **psa, apr_socket_t **ps, char *hostname, apr_int64_t port, request_rec *r)
+{
+    apr_status_t rv;
+    apr_pool_t *mp = r -> pool;
+    rv = apr_sockaddr_info_get (psa, hostname, APR_INET, port, 0, mp);
+    if (rv != APR_SUCCESS)
+        return rv;
+    rv = apr_socket_create (ps, (*psa)->family, SOCK_STREAM, APR_PROTO_TCP, mp);
+    if (rv != APR_SUCCESS)
+        return rv;
+    rv = apr_socket_connect (*ps, *psa);
+    return rv;
+}
+
+static int get_ip_list (apr_socket_t *s, char filepath[], char filebuf[], request_rec *r)
+{
+    #ifdef BLOCKFOREVER
+    #else
+    apr_socket_opt_set(s, APR_SO_NONBLOCK, 1);
+    apr_socket_timeout_set(s, DEF_SOCK_TIMEOUT);
+    #endif BLOCKFOREVER
+
+    apr_size_t len;
+    apr_status_t rv;
+    apr_pool_t *mp = r -> pool;
+    server_rec *sr = r -> server;
+    const char *req_msg = apr_pstrcat(mp, "GET ", filepath, " HTTP/1.0" CRLF_STR CRLF_STR, NULL);
+    char errmsg_buf[120];
+    len = strlen (req_msg);
+    rv = apr_socket_send (s, req_msg, &len);
+    if (rv != APR_SUCCESS) {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
+        return 0;
+    }
+    
+    char *nfilebuf = filebuf;
+    int filebuf_cnt = 0;
+    memset (filebuf, 0, sizeof (filebuf)); /* for the loop to be terminated normally */
+    while(1) {
+        apr_size_t len = BUFSIZE;
+        if (filebuf_cnt + len > FILE_BUFSIZE) {/* file too large */
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the file from url is too large");
+            return 0;
+        }
+        rv = apr_socket_recv (s, nfilebuf, &len);
+        filebuf_cnt += len;
+        nfilebuf += len;
+        if (rv == APR_EOF || len == 0) {
+            break;
+        }
+    }
+    filebuf[filebuf_cnt + 1] = '\n';
+    
+    #ifdef BLOCKFOREVER
+    #else
+    apr_socket_opt_set(s, APR_SO_NONBLOCK, 0);
+    apr_socket_timeout_set(s, DEF_SOCK_TIMEOUT);
+    #endif BLOCKFOREVER
+
+    return 1;
 }
 
 static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, request_rec *r) /* modified */
@@ -393,77 +452,20 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
     #endif DEBUG
 
     /* connection */
-    rv = apr_sockaddr_info_get(&sa, hostname, APR_INET, port, 0, mp);
-    if (rv != APR_SUCCESS) {
-        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
-        return 0;
-    }
-    rv = apr_socket_create(&s, sa->family, SOCK_STREAM, APR_PROTO_TCP, mp);
-    if (rv != APR_SUCCESS) {
-        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
-	return 0;
-    }
-    rv = apr_socket_connect(s, sa);
+    rv = my_connection (&sa, &s, hostname, port, r);
     if (rv != APR_SUCCESS) {
         apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
         ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
         return 0;
     }
 
-    /* #define BLOCKFOREVER */
-    /* get the ip info from remote url */
-    #ifdef BLOCKFOREVER
-    #else
-    apr_socket_opt_set(s, APR_SO_NONBLOCK, 1);
-    apr_socket_timeout_set(s, DEF_SOCK_TIMEOUT);
-    #endif BLOCKFOREVER
-    apr_size_t len;
-    const char *req_msg = apr_pstrcat(mp, "GET ", filepath, " HTTP/1.0" CRLF_STR CRLF_STR, NULL);
-    
-    len = strlen (req_msg);
-    rv = apr_socket_send (s, req_msg, &len);
-    if (rv != APR_SUCCESS) {
-        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
-        return 0;
-    }
-
-    #ifdef DEBUG
-    printf ("req_msg: %s\n\n", req_msg);
-    #endif DEBUG
-
+    /* get ip-list from url */
     char filebuf[FILE_BUFSIZE + 10];
-    char *nfilebuf = filebuf;
-    int filebuf_cnt = 0;
-    memset (filebuf, 0, sizeof (filebuf)); /* for the loop to be terminated normally */
-    while(1) {
-        apr_size_t len = BUFSIZE;
-        if (filebuf_cnt + len > FILE_BUFSIZE) {/* file too large */
-            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the file from url is too large");
-            return 0;
-        }
-        rv = apr_socket_recv (s, nfilebuf, &len);
-        filebuf_cnt += len;
-        nfilebuf += len;
-        if (rv == APR_EOF || len == 0) {
-            break;
-        }
-    }
-    filebuf[filebuf_cnt + 1] = '\n';
-    #ifdef BLOCKFOREVER
-    #else
-    apr_socket_opt_set(s, APR_SO_NONBLOCK, 0);
-    apr_socket_timeout_set(s, DEF_SOCK_TIMEOUT);
-    #endif BLOCKFOREVER
+    if (!get_ip_list (s, filepath, filebuf, r))
+        return 0;
 
-    #ifdef DEBUG
-    printf ("filebuf: %s\n\n", filebuf);
-    #endif DEBUG
-    
     /* process the request whth the data recv from url */
-    nfilebuf = filebuf;
+    char *nfilebuf = filebuf;
     while (1) {
         char *t1 = ap_strchr (nfilebuf, '\r');
         char *t2 = ap_strchr (nfilebuf, '\n');
@@ -516,25 +518,6 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
         }
     }
     return 0;
-    /* while (1) { */
-    /*     apr_size_t len = sizeof(buf);             */
-    /*     apr_status_t rv = apr_socket_recv(sock, buf, &len); */
-    /*     if (strcasecmp (buf, CRLF_STR)) { /\* blank line *\/ */
-    /*         break; */
-    /*     } */
-    /*     if (rv == APR_EOF || len == 0) { /\* nothing return by server *\/ */
-    /*         return 0; */
-    /*     } */
-    /* } */
-    /* while (1) { */
-    /*     apr_size_t len = sizeof(buf); */
-    /*     apr_status_t rv = apr_socket_recv(sock, buf, &len); */
-    /*     if (rv == APR_EOF || len == 0) { */
-    /*         break; */
-    /*     } */
-    /*     if (ip_match (ip_to_be_test, buf)) /\* check if ip_to_be_test is a valid ip *\/ */
-    /*         return 1; */
-    /* } */
 }
 
 static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method)
