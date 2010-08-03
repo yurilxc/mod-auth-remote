@@ -50,6 +50,8 @@
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #define CRLF_STR "\r\n"
 #define DEF_SOCK_TIMEOUT (APR_USEC_PER_SEC * 4)
+/* realtime*/
+#define DEF_EXPIRE_TIME 0
 
 enum allowdeny_type {
     T_ENV,
@@ -77,6 +79,8 @@ typedef struct {
 
 typedef struct {
     int order[METHODS];
+    apr_time_t last_update_time;/* modified */
+    apr_time_t expire_time;/* modified */
     apr_array_header_t *allows;
     apr_array_header_t *denys;
 } auth_remote_dir_conf;
@@ -95,6 +99,10 @@ static void *create_auth_remote_dir_config(apr_pool_t *p, char *dummy)
     conf->allows = apr_array_make(p, 1, sizeof(allowdeny));
     conf->denys = apr_array_make(p, 1, sizeof(allowdeny));
 
+    /* modified */
+    conf->last_update_time = 0;
+    conf->expire_time = DEF_EXPIRE_TIME;
+    
     return (void *)conf;
 }
 
@@ -116,6 +124,26 @@ static const char *order(cmd_parms *cmd, void *dv, const char *arg)
         if (cmd->limited & (AP_METHOD_BIT << i))
             d->order[i] = o;
 
+    return NULL;
+}
+
+/* modified */
+static const char *expire_time_cmd (cmd_parms *cmd, void *dv, const char *s_expire_time)
+{
+    auth_remote_dir_conf *d = (auth_remote_dir_conf *) dv;
+    int i, len = strlen (s_expire_time);
+    apr_time_t ttime = 0;
+    for (i = 0; i < len; i++) {
+        if (s_expire_time[i] <= '9' && s_expire_time[i] >= '0') {
+            ttime = ttime * 10 + (apr_time_t)(s_expire_time[i] - '0');
+        }
+        else {
+            return "the expire time directive is not followed a nonnegative integer";
+        }
+    }
+    for (i = 0; i < METHODS; i++)
+        if (cmd->limited & (AP_METHOD_BIT << i))
+            d->expire_time = apr_time_from_msec (ttime);
     return NULL;
 }
 
@@ -187,6 +215,9 @@ static const command_rec auth_remote_cmds[] =
 {
     AP_INIT_TAKE1("remote_order", order, NULL, OR_LIMIT,
                   "'allow,deny', 'deny,allow', or 'mutual-failure'"),
+    /* modified */
+    AP_INIT_TAKE1("remote_expire_time", expire_time_cmd, NULL, OR_LIMIT,
+                  "a nonnegative integer indicating expire milliseconds"),
     AP_INIT_ITERATE2("remote_allow", allow_cmd, &its_an_allow, OR_LIMIT,
                      "'from' followed by hostnames or IP-address wildcards or url"),
     AP_INIT_ITERATE2("remote_deny", allow_cmd, NULL, OR_LIMIT,
@@ -276,29 +307,6 @@ static int seperate_url (char *remote_url, char **hostname, apr_int64_t *p_port_
 /* the first arg should not be of complex forms */
 static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
 {
-     /* if ((s = ap_strchr(where, '/'))) { */
-    /*     *s++ = '\0'; */
-    /*     rv = apr_ipsubnet_create(&a->x.ip, where, s, cmd->pool); */
-    /*     if(APR_STATUS_IS_EINVAL(rv)) { */
-    /*             /\* looked nothing like an IP address *\/ */
-    /*         return "An IP address was expected"; */
-    /*     } */
-    /*     else if (rv != APR_SUCCESS) { */
-    /*         apr_strerror(rv, msgbuf, sizeof msgbuf); */
-    /*         return apr_pstrdup(cmd->pool, msgbuf); */
-    /*     } */
-    /*     a->type = T_IP; */
-    /* } */
-    /* else if (!APR_STATU
-     * S_IS_EINVAL(rv = apr_ipsubnet_create(&a->x.ip, where, */
-    /*                                                          NULL, cmd->pool))) { */
-    /*     if (rv != APR_SUCCESS) { */
-    /*         apr_strerror(rv, msgbuf, sizeof msgbuf); */
-    /*         return apr_pstrdup(cmd->pool, msgbuf); */
-    /*     } */
-    /*     a->type = T_IP; */
-    /* } */
-
     apr_status_t rv;
     char *s;
     apr_ipsubnet_t *url_ip;
@@ -341,24 +349,83 @@ static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
         }
     }
     #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "mode: %s\n", mode);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "mode: %s", mode);
     #endif DEBUG
 
-     /* case T_IP: */
-     /*        if (apr_ipsubnet_test(ap[i].x.ip, r->connection->remote_addr)) { */
-     /*            return 1; */
-     /*        } */
-     /*        break; */
     if (apr_ipsubnet_test (url_ip, ip)) {
         return 1;
     }
     #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "ip match failed!\n");
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "ip match failed!");
     #endif DEBUG
     return 0;
 }
 
-static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, request_rec *r) /* modified */
+/* modified */
+static apr_status_t my_connection (apr_sockaddr_t **psa, apr_socket_t **ps, char *hostname, apr_int64_t port, request_rec *r)
+{
+    apr_status_t rv;
+    apr_pool_t *mp = r -> pool;
+    rv = apr_sockaddr_info_get (psa, hostname, APR_INET, port, 0, mp);
+    if (rv != APR_SUCCESS)
+        return rv;
+    rv = apr_socket_create (ps, (*psa)->family, SOCK_STREAM, APR_PROTO_TCP, mp);
+    if (rv != APR_SUCCESS)
+        return rv;
+    rv = apr_socket_connect (*ps, *psa);
+    return rv;
+}
+
+static int get_ip_list (apr_socket_t *s, char filepath[], char filebuf[], int filebuf_len, request_rec *r)
+{
+    #ifdef BLOCKFOREVER
+    #else
+    apr_socket_opt_set(s, APR_SO_NONBLOCK, 1);
+    apr_socket_timeout_set(s, DEF_SOCK_TIMEOUT);
+    #endif BLOCKFOREVER
+
+    apr_size_t len;
+    apr_status_t rv;
+    apr_pool_t *mp = r -> pool;
+    server_rec *sr = r -> server;
+    const char *req_msg = apr_pstrcat(mp, "GET ", filepath, " HTTP/1.0" CRLF_STR CRLF_STR, NULL);
+    char errmsg_buf[120];
+    len = strlen (req_msg);
+    rv = apr_socket_send (s, req_msg, &len);
+    if (rv != APR_SUCCESS) {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
+        return 0;
+    }
+    
+    char *nfilebuf = filebuf;
+    int filebuf_cnt = 0;
+    memset (filebuf, 0, sizeof (char) * filebuf_len); /* for the loop to be terminated normally */
+    while(1) {
+        apr_size_t len = BUFSIZE;
+        if (filebuf_cnt + len > filebuf_len) {/* file too large */
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the file from url is too large");
+            return 0;
+        }
+        rv = apr_socket_recv (s, nfilebuf, &len);
+        filebuf_cnt += len;
+        nfilebuf += len;
+        if (rv == APR_EOF || len == 0) {
+            break;
+        }
+    }
+    filebuf[filebuf_cnt] = '\n';
+    
+    #ifdef BLOCKFOREVER
+    #else
+    apr_socket_opt_set(s, APR_SO_NONBLOCK, 0);
+    apr_socket_timeout_set(s, DEF_SOCK_TIMEOUT);
+    #endif BLOCKFOREVER
+
+    return 1;
+}
+
+static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, apr_time_t *p_last_update_time, apr_time_t expire_time, request_rec *r) /* modified */
 {
     apr_status_t rv;
     apr_pool_t *mp = r -> pool;
@@ -392,78 +459,41 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "filepath: %s", filepath);
     #endif DEBUG
 
-    /* connection */
-    rv = apr_sockaddr_info_get(&sa, hostname, APR_INET, port, 0, mp);
-    if (rv != APR_SUCCESS) {
-        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
-        return 0;
-    }
-    rv = apr_socket_create(&s, sa->family, SOCK_STREAM, APR_PROTO_TCP, mp);
-    if (rv != APR_SUCCESS) {
-        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
-	return 0;
-    }
-    rv = apr_socket_connect(s, sa);
-    if (rv != APR_SUCCESS) {
-        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
-        return 0;
-    }
+    apr_time_t cur_time; /* current time */
+    cur_time = apr_time_now ();
+    static char filebuf[FILE_BUFSIZE + 10];
+  
+    if (cur_time - *p_last_update_time > expire_time) { /* the ip-list from url is expired */
 
-    /* #define BLOCKFOREVER */
-    /* get the ip info from remote url */
-    #ifdef BLOCKFOREVER
-    #else
-    apr_socket_opt_set(s, APR_SO_NONBLOCK, 1);
-    apr_socket_timeout_set(s, DEF_SOCK_TIMEOUT);
-    #endif BLOCKFOREVER
-    apr_size_t len;
-    const char *req_msg = apr_pstrcat(mp, "GET ", filepath, " HTTP/1.0" CRLF_STR CRLF_STR, NULL);
-    
-    len = strlen (req_msg);
-    rv = apr_socket_send (s, req_msg, &len);
-    if (rv != APR_SUCCESS) {
-        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
-        return 0;
-    }
-
-    #ifdef DEBUG
-    printf ("req_msg: %s\n\n", req_msg);
-    #endif DEBUG
-
-    char filebuf[FILE_BUFSIZE + 10];
-    char *nfilebuf = filebuf;
-    int filebuf_cnt = 0;
-    memset (filebuf, 0, sizeof (filebuf)); /* for the loop to be terminated normally */
-    while(1) {
-        apr_size_t len = BUFSIZE;
-        if (filebuf_cnt + len > FILE_BUFSIZE) {/* file too large */
-            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the file from url is too large");
+        #ifdef DEBUG
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "cur_time: %lld", cur_time);
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "last_update_time: %lld", *p_last_update_time);
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "expire_time: %lld", expire_time);
+        #endif DEBUG
+        
+        /* update last_update_time */
+        *p_last_update_time = cur_time;
+        
+            /* connection */
+        rv = my_connection (&sa, &s, hostname, port, r);
+        if (rv != APR_SUCCESS) {
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
             return 0;
         }
-        rv = apr_socket_recv (s, nfilebuf, &len);
-        filebuf_cnt += len;
-        nfilebuf += len;
-        if (rv == APR_EOF || len == 0) {
-            break;
-        }
-    }
-    filebuf[filebuf_cnt + 1] = '\n';
-    #ifdef BLOCKFOREVER
-    #else
-    apr_socket_opt_set(s, APR_SO_NONBLOCK, 0);
-    apr_socket_timeout_set(s, DEF_SOCK_TIMEOUT);
-    #endif BLOCKFOREVER
 
-    #ifdef DEBUG
-    printf ("filebuf: %s\n\n", filebuf);
-    #endif DEBUG
-    
+            /* get ip-list from url */
+        if (!get_ip_list (s, filepath, filebuf, FILE_BUFSIZE, r))
+            return 0;
+
+        #ifdef DEBUG
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "expire_update_filebuf: %s", filebuf);
+        #endif DEBUG
+    }
+
     /* process the request whth the data recv from url */
-    nfilebuf = filebuf;
+    //char *nfilebuf = filebuf;
+    char *nfilebuf = apr_pstrdup (mp, filebuf);
     while (1) {
         char *t1 = ap_strchr (nfilebuf, '\r');
         char *t2 = ap_strchr (nfilebuf, '\n');
@@ -482,11 +512,14 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
         nfilebuf = MAX(t1,t2) + 1;
     }
     #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf %s\n", nfilebuf);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf: %s", nfilebuf);
     #endif DEBUG
     while (1) {
         char *t1 = ap_strchr (nfilebuf, '\r');
         char *t2 = ap_strchr (nfilebuf, '\n');
+        #ifdef DEBUG
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf_len: %d", strlen (nfilebuf));
+        #endif DEBUG
         if (t1)
             *t1 = '\0';
         if (t2)
@@ -495,7 +528,7 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
             break;
         }
         #ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf %s\n", nfilebuf);
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf %s", nfilebuf);
         #endif DEBUG
 
         if (ip_match (ip_to_be_test, nfilebuf, r))  {
@@ -516,28 +549,9 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
         }
     }
     return 0;
-    /* while (1) { */
-    /*     apr_size_t len = sizeof(buf);             */
-    /*     apr_status_t rv = apr_socket_recv(sock, buf, &len); */
-    /*     if (strcasecmp (buf, CRLF_STR)) { /\* blank line *\/ */
-    /*         break; */
-    /*     } */
-    /*     if (rv == APR_EOF || len == 0) { /\* nothing return by server *\/ */
-    /*         return 0; */
-    /*     } */
-    /* } */
-    /* while (1) { */
-    /*     apr_size_t len = sizeof(buf); */
-    /*     apr_status_t rv = apr_socket_recv(sock, buf, &len); */
-    /*     if (rv == APR_EOF || len == 0) { */
-    /*         break; */
-    /*     } */
-    /*     if (ip_match (ip_to_be_test, buf)) /\* check if ip_to_be_test is a valid ip *\/ */
-    /*         return 1; */
-    /* } */
 }
 
-static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method)
+static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr_time_t *p_last_update_time, apr_time_t expire_time)
 {
 
     allowdeny *ap = (allowdeny *) a->elts;
@@ -574,7 +588,7 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method)
             break;
 
         case T_URL:             /* modified */
-            if (ip_in_url_test (ap[i].x.from, r->connection->remote_addr, r) == 1) {
+            if (ip_in_url_test (ap[i].x.from, r->connection->remote_addr, p_last_update_time, expire_time, r) == 1) {
                 return 1;
             }
             break;
@@ -617,26 +631,27 @@ static int check_dir_access(request_rec *r)
     auth_remote_dir_conf *a = (auth_remote_dir_conf *)
         ap_get_module_config(r->per_dir_config, &auth_remote_module);
 
+    /* modified */
     if (a->order[method] == ALLOW_THEN_DENY) {
         ret = HTTP_FORBIDDEN;
-        if (find_allowdeny(r, a->allows, method)) {
+        if (find_allowdeny(r, a->allows, method, &(a->last_update_time), a->expire_time)) {
             ret = OK;
         }
-        if (find_allowdeny(r, a->denys, method)) {
+        if (find_allowdeny(r, a->denys, method, &(a->last_update_time), a->expire_time)) {
             ret = HTTP_FORBIDDEN;
         }
     }
     else if (a->order[method] == DENY_THEN_ALLOW) {
-        if (find_allowdeny(r, a->denys, method)) {
+        if (find_allowdeny(r, a->denys, method, &(a->last_update_time), a->expire_time)) {
             ret = HTTP_FORBIDDEN;
         }
-        if (find_allowdeny(r, a->allows, method)) {
+            if (find_allowdeny(r, a->allows, method, &(a->last_update_time), a->expire_time)) {
             ret = OK;
         }
     }
     else {
-        if (find_allowdeny(r, a->allows, method)
-            && !find_allowdeny(r, a->denys, method)) {
+        if (find_allowdeny(r, a->allows, method, &(a->last_update_time), a->expire_time)
+            && !find_allowdeny(r, a->denys, method, &(a->last_update_time), a->expire_time)) {
             ret = OK;
         }
         else {
