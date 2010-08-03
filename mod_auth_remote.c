@@ -349,14 +349,14 @@ static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
         }
     }
     #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "mode: %s\n", mode);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "mode: %s", mode);
     #endif DEBUG
 
     if (apr_ipsubnet_test (url_ip, ip)) {
         return 1;
     }
     #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "ip match failed!\n");
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "ip match failed!");
     #endif DEBUG
     return 0;
 }
@@ -376,7 +376,7 @@ static apr_status_t my_connection (apr_sockaddr_t **psa, apr_socket_t **ps, char
     return rv;
 }
 
-static int get_ip_list (apr_socket_t *s, char filepath[], char filebuf[], request_rec *r)
+static int get_ip_list (apr_socket_t *s, char filepath[], char filebuf[], int filebuf_len, request_rec *r)
 {
     #ifdef BLOCKFOREVER
     #else
@@ -400,10 +400,10 @@ static int get_ip_list (apr_socket_t *s, char filepath[], char filebuf[], reques
     
     char *nfilebuf = filebuf;
     int filebuf_cnt = 0;
-    memset (filebuf, 0, sizeof (filebuf)); /* for the loop to be terminated normally */
+    memset (filebuf, 0, sizeof (char) * filebuf_len); /* for the loop to be terminated normally */
     while(1) {
         apr_size_t len = BUFSIZE;
-        if (filebuf_cnt + len > FILE_BUFSIZE) {/* file too large */
+        if (filebuf_cnt + len > filebuf_len) {/* file too large */
             ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the file from url is too large");
             return 0;
         }
@@ -414,7 +414,7 @@ static int get_ip_list (apr_socket_t *s, char filepath[], char filebuf[], reques
             break;
         }
     }
-    filebuf[filebuf_cnt + 1] = '\n';
+    filebuf[filebuf_cnt] = '\n';
     
     #ifdef BLOCKFOREVER
     #else
@@ -466,9 +466,9 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
     if (cur_time - *p_last_update_time > expire_time) { /* the ip-list from url is expired */
 
         #ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "cur_time: %lld\n", cur_time);
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "last_update_time: %lld\n", *p_last_update_time);
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "expire_time: %lld\n", expire_time);
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "cur_time: %lld", cur_time);
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "last_update_time: %lld", *p_last_update_time);
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "expire_time: %lld", expire_time);
         #endif DEBUG
         
         /* update last_update_time */
@@ -483,8 +483,12 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
         }
 
             /* get ip-list from url */
-        if (!get_ip_list (s, filepath, filebuf, r))
+        if (!get_ip_list (s, filepath, filebuf, FILE_BUFSIZE, r))
             return 0;
+
+        #ifdef DEBUG
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "expire_update_filebuf: %s", filebuf);
+        #endif DEBUG
     }
 
     /* process the request whth the data recv from url */
@@ -508,11 +512,14 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
         nfilebuf = MAX(t1,t2) + 1;
     }
     #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf %s\n", nfilebuf);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf: %s", nfilebuf);
     #endif DEBUG
     while (1) {
         char *t1 = ap_strchr (nfilebuf, '\r');
         char *t2 = ap_strchr (nfilebuf, '\n');
+        #ifdef DEBUG
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf_len: %d", strlen (nfilebuf));
+        #endif DEBUG
         if (t1)
             *t1 = '\0';
         if (t2)
@@ -521,7 +528,7 @@ static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, 
             break;
         }
         #ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf %s\n", nfilebuf);
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf %s", nfilebuf);
         #endif DEBUG
 
         if (ip_match (ip_to_be_test, nfilebuf, r))  {
