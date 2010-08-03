@@ -138,7 +138,7 @@ static const char *expire_time_cmd (cmd_parms *cmd, void *dv, const char *s_expi
             ttime = ttime * 10 + (apr_time_t)(s_expire_time[i] - '0');
         }
         else {
-            return "the expire time directive is not followed an integer";
+            return "the expire time directive is not followed a nonnegative integer";
         }
     }
     for (i = 0; i < METHODS; i++)
@@ -217,7 +217,7 @@ static const command_rec auth_remote_cmds[] =
                   "'allow,deny', 'deny,allow', or 'mutual-failure'"),
     /* modified */
     AP_INIT_TAKE1("remote_expire_time", expire_time_cmd, NULL, OR_LIMIT,
-                  "an interger indicating seconds"),
+                  "a nonnegative integer indicating expire milliseconds"),
     AP_INIT_ITERATE2("remote_allow", allow_cmd, &its_an_allow, OR_LIMIT,
                      "'from' followed by hostnames or IP-address wildcards or url"),
     AP_INIT_ITERATE2("remote_deny", allow_cmd, NULL, OR_LIMIT,
