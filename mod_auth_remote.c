@@ -50,8 +50,8 @@
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #define CRLF_STR "\r\n"
 #define DEF_SOCK_TIMEOUT (APR_USEC_PER_SEC * 4)
-/* 100ms */
-#define DEF_EXPIRE_TIME 100000
+/* realtime*/
+#define DEF_EXPIRE_TIME 0
 
 enum allowdeny_type {
     T_ENV,
