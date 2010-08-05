@@ -40,13 +40,11 @@
 #include <netinet/in.h>
 #endif
 
-/* modified */
 #define DEBUG
 #include <stdio.h>
 #define BUF_SIZE 1024
 #define FILE_SIZE ((17 + 1) * (20000 + 10) + BUF_SIZE)
 #define HEADER_SIZE (4096 + BUF_SIZE)
-//#define FILE_BUFSIZE (10)
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #define CRLF_STR "\r\n"
@@ -60,7 +58,7 @@ enum allowdeny_type {
     T_ALL,
     T_IP,
     T_HOST,
-    T_URL,                      /* modified */
+    T_URL,                     
     T_FAIL
 };
 
@@ -111,7 +109,6 @@ static void *create_auth_remote_dir_config(apr_pool_t *p, char *dummy)
     conf->allows = apr_array_make(p, 1, sizeof(allowdeny));
     conf->denys = apr_array_make(p, 1, sizeof(allowdeny));
 
-    /* modified */
     conf->last_update_time = 0;
     conf->expire_time = DEF_EXPIRE_TIME;
     
@@ -145,7 +142,6 @@ static const char *order(cmd_parms *cmd, void *dv, const char *arg)
     return NULL;
 }
 
-/* modified */
 static const char *expire_time_cmd (cmd_parms *cmd, void *dv, const char *s_expire_time)
 {
     auth_remote_dir_conf *d = (auth_remote_dir_conf *) dv;
@@ -232,7 +228,7 @@ static const char *allow_cmd(cmd_parms *cmd, void *dv, const char *from,
     else if (!strcasecmp(where, "all")) {
         a->type = T_ALL;
     }
-    else if (!strncasecmp (where, "url=", 4))   /* modified */ {
+    else if (!strncasecmp (where, "url=", 4)){
         a->type = T_URL;
         if (parse_url (cmd->pool, where + 4, &(a->hostname), &(a->port), &(a->filepath)) == -1) {
             return "reading url error";
@@ -272,7 +268,6 @@ static const command_rec auth_remote_cmds[] =
 {
     AP_INIT_TAKE1("remote_order", order, NULL, OR_LIMIT,
                   "'allow,deny', 'deny,allow', or 'mutual-failure'"),
-    /* modified */
     AP_INIT_TAKE1("remote_expire_time", expire_time_cmd, NULL, OR_LIMIT,
                   "a nonnegative integer indicating expire milliseconds"),
     AP_INIT_ITERATE2("remote_allow", allow_cmd, &its_an_allow, OR_LIMIT,
@@ -307,64 +302,6 @@ static int in_domain(const char *domain, const char *what)
     else {
         return 0;
     }
-}
-
-/* modified */
-/* the first arg should not be of complex forms */
-static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
-{
-    apr_status_t rv;
-    char *s;
-    apr_ipsubnet_t *url_ip;
-    apr_pool_t *mp = r -> pool;
-    server_rec *sr = r -> server;
-    char errmsg_buf[120];
-
-        /* blank line is invalid in allow(deny) directive, but if it appears in the ip-list from url, it will incorectly match all ip in my module */
-    {
-        int i, len = strlen (mode);
-        for (i = 0; i < len; i++) /* it also exclude the situation when (strlen(mode) == 0) */
-            if (mode[i] != ' ') {
-                break;
-            }
-        if (i >= len) {
-            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "url is a blank line.");
-            return 0;
-        }
-    }
-    
-    if (s = ap_strchr (mode, '/')) {
-        *s++ = '\0';
-        rv = apr_ipsubnet_create (&url_ip, mode, s, mp);
-        if (APR_STATUS_IS_EINVAL(rv)) {
-            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "a directive in url is not a valid ip address.");
-            return 0;
-        }
-        else if (rv != APR_SUCCESS) {
-            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
-            return 0;
-        }
-     }
-    else {
-        rv = apr_ipsubnet_create (&url_ip, mode, NULL, mp);
-        if (rv != APR_SUCCESS) {
-            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
-            return 0;
-        }
-    }
-    #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "mode: %s", mode);
-    #endif DEBUG
-
-    if (apr_ipsubnet_test (url_ip, ip)) {
-        return 1;
-    }
-    #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "ip match failed!");
-    #endif DEBUG
-    return 0;
 }
 
 /* input: request_rec, hostname, port_number and filepath */
@@ -528,7 +465,7 @@ static apr_status_t get_ipsubnet_list_from_file_content (apr_pool_t *mp, char *f
                 if (file_content[i] != ' ')
                     break;
             }
-            /* not a blank line */
+            /*be sure not a blank line */
             if (k < i) {
                 pip = apr_array_push (p_ipsubnet_list);
                 file_content[i] = '\0';
@@ -561,7 +498,7 @@ static int ip_in_ipsubnet_list_test (apr_sockaddr_t *ip_to_be_test, apr_array_he
     return 0;
 }
 
-static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, char *hostname, apr_int64_t port, char *filepath, apr_time_t *p_last_update_time, apr_time_t expire_time) /* modified */
+static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, char *hostname, apr_int64_t port, char *filepath, apr_time_t *p_last_update_time, apr_time_t expire_time)
 {
     apr_status_t rv;
     apr_pool_t *mp = r -> pool;
@@ -625,6 +562,7 @@ static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, char *
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "ipsubnet_list_num: %d\n", svr_conf -> p_ipsubnet_list -> nelts);
     #endif DEBUG
 
+        /* check if the request's ip is match one of the ipsubnets getting from url */
     return ip_in_ipsubnet_list_test (ip_to_be_test, svr_conf -> p_ipsubnet_list);
 }
 
@@ -664,7 +602,7 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr
             }
             break;
 
-        case T_URL:             /* modified */
+        case T_URL:
             if (ip_in_url_test (r, r->connection->remote_addr, ap[i].hostname, ap[i].port, ap[i].filepath, p_last_update_time, expire_time) == 1) {
                 return 1;
             }
@@ -708,7 +646,6 @@ static int check_dir_access(request_rec *r)
     auth_remote_dir_conf *a = (auth_remote_dir_conf *)
         ap_get_module_config(r->per_dir_config, &auth_remote_module);
 
-    /* modified */
     if (a->order[method] == ALLOW_THEN_DENY) {
         ret = HTTP_FORBIDDEN;
         if (find_allowdeny(r, a->allows, method, &(a->last_update_time), a->expire_time)) {
@@ -747,7 +684,7 @@ static int check_dir_access(request_rec *r)
     return ret;
 }
 
-/* eache time a subprocess is created, this function will initialize some configuration for this subprocess */
+/* each time a subprocess is created, this function will initialize some configuration for this subprocess */
 static void child_init (apr_pool_t *pchild, server_rec *s)
 {
     apr_status_t rv;
