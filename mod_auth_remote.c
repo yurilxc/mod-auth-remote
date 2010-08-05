@@ -43,8 +43,9 @@
 /* modified */
 #define DEBUG
 #include <stdio.h>
-#define BUFSIZE 255
-#define FILE_BUFSIZE ((16 + 1) * (20000 + 10))
+#define BUF_SIZE 1024
+#define FILE_SIZE ((17 + 1) * (20000 + 10) + BUF_SIZE)
+#define HEADER_SIZE (4096 + BUF_SIZE)
 //#define FILE_BUFSIZE (10)
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define MAX(a,b) ((a)>(b)?(a):(b))
@@ -65,6 +66,9 @@ enum allowdeny_type {
 
 typedef struct {
     apr_int64_t limited;
+    char *hostname;
+    apr_int64_t port;
+    char *filepath;
     union {
         char *from;
         apr_ipsubnet_t *ip;
@@ -79,11 +83,19 @@ typedef struct {
 
 typedef struct {
     int order[METHODS];
-    apr_time_t last_update_time;/* modified */
-    apr_time_t expire_time;/* modified */
     apr_array_header_t *allows;
     apr_array_header_t *denys;
+    apr_time_t last_update_time;
+    apr_time_t expire_time;
 } auth_remote_dir_conf;
+
+typedef struct {
+#ifdef APR_HAS_THREADS
+    apr_thread_mutex_t *mutex;
+#endif
+    apr_pool_t *subpool;
+    apr_array_header_t *p_ipsubnet_list;/* an array including pointers to apr_ipsubnet_t */
+} auth_remote_svr_conf;
 
 module AP_MODULE_DECLARE_DATA auth_remote_module;
 
@@ -103,6 +115,12 @@ static void *create_auth_remote_dir_config(apr_pool_t *p, char *dummy)
     conf->last_update_time = 0;
     conf->expire_time = DEF_EXPIRE_TIME;
     
+    return (void *)conf;
+}
+
+static void *create_auth_remote_svr_config (apr_pool_t *p, server_rec *s)
+{
+    auth_remote_svr_conf *conf = (auth_remote_svr_conf *)apr_pcalloc (p, sizeof (auth_remote_svr_conf));
     return (void *)conf;
 }
 
@@ -147,6 +165,43 @@ static const char *expire_time_cmd (cmd_parms *cmd, void *dv, const char *s_expi
     return NULL;
 }
 
+/* seperate url to hostname, port and filepath */
+/* return -1 means error, an error message puts to stdout*/
+static int parse_url (apr_pool_t *mp, char *ori_remote_url, char **hostname, apr_int64_t *p_port_num, char **filepath)
+{
+    char *remote_url = apr_pstrdup (mp, ori_remote_url);
+    char *p_port_str;
+    char *p_tmp;
+
+    *hostname = remote_url;
+    if (!strncasecmp (*hostname, "http://", 7)) {
+        *hostname += 7;
+    }
+
+    p_tmp = ap_strchr (*hostname, '/');
+    
+    if (p_tmp) {
+        *filepath = apr_pstrdup (mp, p_tmp);
+        *p_tmp = '\0';
+    }
+    else {
+        *filepath = apr_pstrdup (mp, "/");
+    }
+
+    *p_port_num = 0;
+    if (p_port_str = ap_strchr (*hostname, ':')) {
+        *p_port_str = '\0';
+        p_port_str++;
+        *p_port_num = apr_atoi64 (p_port_str);
+    }
+
+    if (errno == ERANGE) {
+        printf ("port number overflow\n");
+        return -1;
+    }
+    return 0;
+}
+
 static const char *allow_cmd(cmd_parms *cmd, void *dv, const char *from,
                              const char *where_c)
 {
@@ -179,7 +234,9 @@ static const char *allow_cmd(cmd_parms *cmd, void *dv, const char *from,
     }
     else if (!strncasecmp (where, "url=", 4))   /* modified */ {
         a->type = T_URL;
-        a->x.from += 4;
+        if (parse_url (cmd->pool, where + 4, &(a->hostname), &(a->port), &(a->filepath)) == -1) {
+            return "reading url error";
+        }
     }
     else if ((s = ap_strchr(where, '/'))) {
         *s++ = '\0';
@@ -252,57 +309,6 @@ static int in_domain(const char *domain, const char *what)
     }
 }
 
-/* seperate url to hostname port and filepath */
-static int seperate_url (char *remote_url, char **hostname, apr_int64_t *p_port_num, char **filepath, request_rec *r)
-{
-    /* else if ((s = ap_strchr(where, '/'))) { */
-    /* *s++ = '\0'; */
-    printf ("get in seperate_url\n");
-    char * p_port_str;
-    char * p_tmp;
-    apr_pool_t *mp = r -> pool;
-    server_rec *sr = r -> server;  
-   
-    *hostname = remote_url;
-    if (!strncasecmp (*hostname, "http://", 7)) {
-        *hostname += 7;
-    }
-    
-    p_tmp = ap_strchr (*hostname, '/');
-    if (!p_tmp) {
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "%s", *hostname);
-        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "no filepath in url");
-        return 0;
-    }
-    *filepath = apr_pstrdup (mp, p_tmp);
-    *p_tmp = '\0';
-
-    if (p_port_str = ap_strchr (*hostname, ':')) {
-        *p_port_str = 0;
-        p_port_str++;
-        *p_port_num = apr_atoi64 (p_port_str);
-    }
-    else {
-        *p_port_num = 80;       /* default port number*/
-    }
-    
-    #ifdef DEBUG
-    printf ("get out seperate_url\n");
-    if (*hostname)
-        printf ("hostname: %s\n", *hostname);
-    else
-        printf ("no hostname\n");
-    printf ("port: %d\n", (int)(*p_port_num));
-    if (*filepath)
-        printf ("filepath: %s\n", *filepath);
-    else
-        printf ("no filepath\n");
-    printf ("\n");
-    #endif DEBUG
-    
-    return 1;
-}
-
 /* modified */
 /* the first arg should not be of complex forms */
 static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
@@ -361,29 +367,33 @@ static int ip_match (apr_sockaddr_t *ip, char *mode, request_rec *r)
     return 0;
 }
 
-/* modified */
-static apr_status_t my_connection (apr_sockaddr_t **psa, apr_socket_t **ps, char *hostname, apr_int64_t port, request_rec *r)
+/* input: request_rec, hostname, port_number and filepath */
+/* output: apr_socket_t, apr_sockaddr_t */
+static apr_status_t build_connection (request_rec *r, const char *hostname, const apr_int64_t port, const char *filepath, apr_socket_t **ps, apr_sockaddr_t **psa)
 {
     apr_status_t rv;
     apr_pool_t *mp = r -> pool;
     rv = apr_sockaddr_info_get (psa, hostname, APR_INET, port, 0, mp);
     if (rv != APR_SUCCESS)
         return rv;
-    rv = apr_socket_create (ps, (*psa)->family, SOCK_STREAM, APR_PROTO_TCP, mp);
+    rv = apr_socket_create (ps, (*psa) -> family, SOCK_STREAM, APR_PROTO_TCP, mp);
     if (rv != APR_SUCCESS)
         return rv;
     rv = apr_socket_connect (*ps, *psa);
     return rv;
 }
 
-static int get_ip_list (apr_socket_t *s, char filepath[], char filebuf[], int filebuf_len, request_rec *r)
+/* get the content of the file from url */
+/* input: apr_socket_t, apr_sockaddr_t, filepath */
+/* output: file_content and file_size, adding a '\n' after the file_content*/
+/* return -1 means error */
+static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_sockaddr_t *sa, char *filepath, char **p_file_content, apr_int64_t *p_file_len)
 {
-    #ifdef BLOCKFOREVER
-    #else
-    apr_socket_opt_set(s, APR_SO_NONBLOCK, 1);
-    apr_socket_timeout_set(s, DEF_SOCK_TIMEOUT);
-    #endif BLOCKFOREVER
+    /* set timeout */
+    apr_socket_opt_set (s, APR_SO_NONBLOCK, 1);
+    apr_socket_timeout_set (s, DEF_SOCK_TIMEOUT);
 
+    int i, lab;
     apr_size_t len;
     apr_status_t rv;
     apr_pool_t *mp = r -> pool;
@@ -395,160 +405,227 @@ static int get_ip_list (apr_socket_t *s, char filepath[], char filebuf[], int fi
     if (rv != APR_SUCCESS) {
         apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
         ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
-        return 0;
+        return -1;
     }
-    
-    char *nfilebuf = filebuf;
-    int filebuf_cnt = 0;
-    memset (filebuf, 0, sizeof (char) * filebuf_len); /* for the loop to be terminated normally */
-    while(1) {
-        apr_size_t len = BUFSIZE;
-        if (filebuf_cnt + len > filebuf_len) {/* file too large */
-            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the file from url is too large");
-            return 0;
+
+    char *p_blank_line_following_header;
+    char header[HEADER_SIZE + 10];
+    char *nheader = header, *nfile_content, *file_content;
+    apr_int64_t header_len = 0, file_len = 0, file_len_in_header;
+    while (1) {
+        len = BUF_SIZE;
+        if (header_len + len >= HEADER_SIZE) {
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the header size is too large.");
+            return -1;
         }
-        rv = apr_socket_recv (s, nfilebuf, &len);
-        filebuf_cnt += len;
-        nfilebuf += len;
-        if (rv == APR_EOF || len == 0) {
+        rv = apr_socket_recv (s, nheader, &len);
+        if (header_len == 0 && strncmp (header, CRLF_STR, 2) == 0) {
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the header does not cotain \"Content-Length\" domain.");
+            return -1;
+        }
+        for (i = 2, lab = 0; i < header_len + len; i++) {
+            if (strncmp (header + i, CRLF_STR CRLF_STR, 4) == 0)
+            {
+                lab = 1;
+                p_blank_line_following_header = header + i;
+                break;
+            }
+        }
+        if (lab)
+        {
+            header_len += len;
             break;
         }
+            
+        header_len += len;
+        nheader += len;
     }
-    filebuf[filebuf_cnt] = '\n';
-    
-    #ifdef BLOCKFOREVER
-    #else
-    apr_socket_opt_set(s, APR_SO_NONBLOCK, 0);
-    apr_socket_timeout_set(s, DEF_SOCK_TIMEOUT);
-    #endif BLOCKFOREVER
+    header[header_len] = '\0';
+    p_blank_line_following_header += 2;
+    *p_blank_line_following_header = '\0';
+    for (nheader = header; *nheader != '\0'; nheader++) {
+        if (strncmp (nheader, "Content-Length", 14) == 0)
+            break;
+    }
+    if (*nheader == '\0') {
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the header does not cotain \"Content-Length\" domain.");
+        return -1;
+    }
+    else {
+        nheader = ap_strchr (nheader, ':');
+        if (!nheader) {
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the header does not cotain \"Content-Length\" domain.");
+            return -1;
+        }
+        else {
+            char *tp = ap_strchr (nheader, '\r');
+            if (!tp) {
+                ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "an unkown bug");
+                return -1;
+            }
+            *tp = '\0';
+            file_len_in_header = apr_atoi64 (nheader + 1);
+            *tp = '\r';
+        }
+    }
+    #ifdef DEBUG
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "Content-Length: %lld", file_len_in_header);
+    #endif
+    if (file_len_in_header >= FILE_SIZE) {
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the file from url is too large");
+        return -1;
+    }
+    file_len = strlen (p_blank_line_following_header + 2);
+    if (file_len > file_len_in_header) {
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the file's size does not match the \"Content-Length\" domain");
+        return -1;
+    }
+    file_content = apr_palloc (mp, file_len_in_header + BUF_SIZE);
+    nfile_content = file_content + file_len;
+    strcpy (file_content, p_blank_line_following_header + 2);
 
-    return 1;
+    while (1)
+    {
+        len = BUF_SIZE;
+        rv = apr_socket_recv (s, nfile_content, &len);
+        file_len += len;
+        nfile_content += len;
+        if (file_len > file_len_in_header) {
+            break;
+        }
+        if (rv == APR_EOF || len == 0)
+            break;
+    }
+    
+    #ifdef DEBUG
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "file_content: %s", file_content);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "file_len_in_header: %lld", file_len_in_header);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "file_len: %lld", file_len);
+    #endif DEBUG
+    
+    if (file_len != file_len_in_header) {
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "the file's size does not match the \"Content-Length\" domain");
+        return -1;
+    }
+    file_content[file_len] = '\n';
+    *p_file_content = file_content;
+    *p_file_len = file_len;
+    return 0;
 }
 
-static int ip_in_url_test (char *ori_remote_url, apr_sockaddr_t *ip_to_be_test, apr_time_t *p_last_update_time, apr_time_t expire_time, request_rec *r) /* modified */
+/* input:file_content and file_len, file_content ending with '\n' */
+/* output:p_ipsubnet_list */
+static apr_status_t get_ipsubnet_list_from_file_content (apr_pool_t *mp, char *file_content, apr_int64_t file_len, apr_array_header_t *p_ipsubnet_list)
+{
+    int i, j, k;
+    apr_status_t rv;
+    char *tp;
+    apr_ipsubnet_t **pip;
+
+    for (i = j = 0; i <= file_len; i++) {
+        if (file_content[i] == '\r' || file_content[i] == '\n') {
+            for (k = j; k < i; k++) {
+                if (file_content[i] != ' ')
+                    break;
+            }
+            /* not a blank line */
+            if (k < i) {
+                pip = apr_array_push (p_ipsubnet_list);
+                file_content[i] = '\0';
+                if (tp = ap_strchr (file_content + j, '/')) {
+                    *tp++ = '\0';
+                    rv = apr_ipsubnet_create (pip, file_content + j, tp, mp);
+                }
+                else {
+                    rv = apr_ipsubnet_create (pip, file_content + j, NULL, mp);
+                }
+                if (rv != APR_SUCCESS)
+                    return rv;
+            }
+            j = i + 1;
+        }
+    }
+    return APR_SUCCESS;
+}
+
+/* input:ip_to_be_test, p_ipsubnet_list */
+/* return 1 means match, 0 means error or unmatch */
+static int ip_in_ipsubnet_list_test (apr_sockaddr_t *ip_to_be_test, apr_array_header_t *p_ipsubnet_list)
+{
+    int i, len = p_ipsubnet_list -> nelts;
+    apr_ipsubnet_t **p_ipsubnet = (apr_ipsubnet_t **) p_ipsubnet_list -> elts;
+    for (i = 0; i < len; i++) {
+        if (apr_ipsubnet_test (p_ipsubnet[i], ip_to_be_test))
+            return 1;
+    }
+    return 0;
+}
+
+static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, char *hostname, apr_int64_t port, char *filepath, apr_time_t *p_last_update_time, apr_time_t expire_time) /* modified */
 {
     apr_status_t rv;
     apr_pool_t *mp = r -> pool;
     server_rec *sr = r -> server;
+    auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);
     
-    apr_socket_t *s;
-    apr_sockaddr_t *sa;
-
-    char *hostname;
-    char *filepath;
-    apr_int64_t port;
-
     char errmsg_buf[120];
 
-    char *remote_url;
-    remote_url = apr_pstrdup (mp, ori_remote_url); /* remote_url will be changed, so make a copy*/
-
     #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "remote_url: %s", remote_url);
-    #endif DEBUG
-
-    /* seperate url to hostname port and filepath */
-    if (!seperate_url (remote_url, &hostname, &port, &filepath, r)) { /* error */
-        return 0;
-    }
-    else {                      /* normal */
-        ;
-    }
-
-    #ifdef DEBUG
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "hostname: %s", hostname);
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "filepath: %s", filepath);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "port: %lld", port);
     #endif DEBUG
 
-    apr_time_t cur_time; /* current time */
-    cur_time = apr_time_now ();
-    static char filebuf[FILE_BUFSIZE + 10];
-  
-    if (cur_time - *p_last_update_time > expire_time) { /* the ip-list from url is expired */
+    if (apr_time_now () - *p_last_update_time > expire_time) { /* the ip-list from url is expired */
 
         #ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "cur_time: %lld", cur_time);
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "cur_time: %lld", apr_time_now ());
         ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "last_update_time: %lld", *p_last_update_time);
         ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "expire_time: %lld", expire_time);
         #endif DEBUG
         
-        /* update last_update_time */
-        *p_last_update_time = cur_time;
+            /* update last_update_time */
+        *p_last_update_time = apr_time_now ();
+
+            /* clear the subprocess pool for preventing leakage */
+        apr_pool_clear (svr_conf -> subpool);
+        svr_conf -> p_ipsubnet_list = apr_array_make (svr_conf -> subpool, 0, sizeof (apr_ipsubnet_t*));
+
+        apr_socket_t *s;
+        apr_sockaddr_t *sa;
         
-            /* connection */
-        rv = my_connection (&sa, &s, hostname, port, r);
+            /* build connection */
+        rv = build_connection (r, hostname, port, filepath, &s, &sa);
         if (rv != APR_SUCCESS) {
             apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
             ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
             return 0;
         }
 
-            /* get ip-list from url */
-        if (!get_ip_list (s, filepath, filebuf, FILE_BUFSIZE, r))
+            /* get file content from url */
+        apr_int64_t file_len;
+        char *file_content;
+        if (get_file_content_from_url (r, s, sa, filepath, &file_content, &file_len) == -1) {
             return 0;
+        }
 
         #ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "expire_update_filebuf: %s", filebuf);
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "file_content: %s", file_content);
         #endif DEBUG
+
+            /* get the ipsubnet_list and update it with file_content*/
+        rv = get_ipsubnet_list_from_file_content (svr_conf -> subpool, file_content, file_len, svr_conf -> p_ipsubnet_list);
+        if (rv != APR_SUCCESS) {
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "%s", errmsg_buf);
+        }
     }
 
-    /* process the request whth the data recv from url */
-    //char *nfilebuf = filebuf;
-    char *nfilebuf = apr_pstrdup (mp, filebuf);
-    while (1) {
-        char *t1 = ap_strchr (nfilebuf, '\r');
-        char *t2 = ap_strchr (nfilebuf, '\n');
-        if (t1)
-            *t1 = '\0';
-        if (t2)
-            *t2 = '\0';
-        if (!t1 && !t2) {       /* an unkonwn bug */
-            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "an unknown bug");
-            return 0;
-        }
-        if (strlen (nfilebuf) == 0) { /* blank line */
-            nfilebuf = MAX(t1,t2) + 1;
-            break;
-        }
-        nfilebuf = MAX(t1,t2) + 1;
-    }
     #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf: %s", nfilebuf);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "ipsubnet_list_num: %d\n", svr_conf -> p_ipsubnet_list -> nelts);
     #endif DEBUG
-    while (1) {
-        char *t1 = ap_strchr (nfilebuf, '\r');
-        char *t2 = ap_strchr (nfilebuf, '\n');
-        #ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf_len: %d", strlen (nfilebuf));
-        #endif DEBUG
-        if (t1)
-            *t1 = '\0';
-        if (t2)
-            *t2 = '\0';
-        if (!t1 && !t2) {
-            break;
-        }
-        #ifdef DEBUG
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, sr, "nfilebuf %s", nfilebuf);
-        #endif DEBUG
 
-        if (ip_match (ip_to_be_test, nfilebuf, r))  {
-            return 1;
-        }
-        if (t1 && t2) {
-            nfilebuf = MAX(t1,t2) + 1;
-        }
-        else if (t1) {
-            nfilebuf = t1 + 1;
-        }
-        else if (t2) {
-            nfilebuf = t2 + 1;
-        }
-        else  {
-            ap_log_error(APLOG_MARK, APLOG_INFO, 0, sr, "an unknown bug");
-            return 0;
-        }
-    }
-    return 0;
+    return ip_in_ipsubnet_list_test (ip_to_be_test, svr_conf -> p_ipsubnet_list);
 }
 
 static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr_time_t *p_last_update_time, apr_time_t expire_time)
@@ -588,7 +665,7 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr
             break;
 
         case T_URL:             /* modified */
-            if (ip_in_url_test (ap[i].x.from, r->connection->remote_addr, p_last_update_time, expire_time, r) == 1) {
+            if (ip_in_url_test (r, r->connection->remote_addr, ap[i].hostname, ap[i].port, ap[i].filepath, p_last_update_time, expire_time) == 1) {
                 return 1;
             }
             break;
@@ -670,10 +747,39 @@ static int check_dir_access(request_rec *r)
     return ret;
 }
 
+/* eache time a subprocess is created, this function will initialize some configuration for this subprocess */
+static void child_init (apr_pool_t *pchild, server_rec *s)
+{
+    apr_status_t rv;
+
+    auth_remote_svr_conf *svr_conf = ap_get_module_config (s -> module_config, &auth_remote_module);
+
+    rv = apr_pool_create (&(svr_conf -> subpool), pchild);
+    if (rv != APR_SUCCESS) {
+        ap_log_perror (APLOG_MARK, APLOG_CRIT, rv, pchild, "Failed to create subpool for auth_remote_module");
+        return ;
+    }
+
+        /* create mutex */
+#ifdef APR_HAS_THREADS
+    rv = apr_thread_mutex_create(&svr_conf->mutex,
+                                 APR_THREAD_MUTEX_DEFAULT, pchild);
+    if (rv != APR_SUCCESS) {
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, pchild,
+                      "Failed to create mutex for auth_remote_module");
+        return;
+    }
+
+    svr_conf -> p_ipsubnet_list = apr_array_make (svr_conf -> subpool, 0, sizeof (apr_ipsubnet_t*));
+#endif
+}
+
 static void auth_remote_hooks(apr_pool_t *p)
 {
     /* This can be access checker since we don't require r->user to be set. */
     ap_hook_access_checker(check_dir_access,NULL,NULL,APR_HOOK_MIDDLE);
+
+    ap_hook_child_init (child_init, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
 module AP_MODULE_DECLARE_DATA auth_remote_module =
@@ -681,7 +787,7 @@ module AP_MODULE_DECLARE_DATA auth_remote_module =
     STANDARD20_MODULE_STUFF,
     create_auth_remote_dir_config,   /* dir config creater */
     NULL,                           /* dir merger --- default is to override */
-    NULL,                           /* server config */
+    create_auth_remote_svr_config,   /* server config */
     NULL,                           /* merge server config */
     auth_remote_cmds,
     auth_remote_hooks                  /* register hooks */
