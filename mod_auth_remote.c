@@ -49,6 +49,7 @@
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #define CRLF_STR "\r\n"
 #define DEF_SOCK_TIMEOUT (APR_USEC_PER_SEC * 4)
+#define DEF_PORT_NUM 80
 /* realtime*/
 #define DEF_EXPIRE_TIME 0
 
@@ -157,7 +158,7 @@ static const char *expire_time_cmd (cmd_parms *cmd, void *dv, const char *s_expi
     }
     for (i = 0; i < METHODS; i++)
         if (cmd->limited & (AP_METHOD_BIT << i))
-            d->expire_time = apr_time_from_msec (ttime);
+            d->expire_time = apr_time_from_sec (ttime);
     return NULL;
 }
 
@@ -184,7 +185,7 @@ static int parse_url (apr_pool_t *mp, char *ori_remote_url, char **hostname, apr
         *filepath = apr_pstrdup (mp, "/");
     }
 
-    *p_port_num = 0;
+    *p_port_num = DEF_PORT_NUM;
     if (p_port_str = ap_strchr (*hostname, ':')) {
         *p_port_str = '\0';
         p_port_str++;
@@ -269,7 +270,7 @@ static const command_rec auth_remote_cmds[] =
     AP_INIT_TAKE1("remote_order", order, NULL, OR_LIMIT,
                   "'allow,deny', 'deny,allow', or 'mutual-failure'"),
     AP_INIT_TAKE1("remote_expire_time", expire_time_cmd, NULL, OR_LIMIT,
-                  "a nonnegative integer indicating expire milliseconds"),
+                  "a nonnegative integer indicating expire seconds"),
     AP_INIT_ITERATE2("remote_allow", allow_cmd, &its_an_allow, OR_LIMIT,
                      "'from' followed by hostnames or IP-address wildcards or url"),
     AP_INIT_ITERATE2("remote_deny", allow_cmd, NULL, OR_LIMIT,
@@ -433,11 +434,11 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
             break;
     }
     
-    #ifdef DEBUG
+#ifdef DEBUG
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_content: %s", file_content);
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_len_in_header: %lld", file_len_in_header);
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_len: %lld", file_len);
-    #endif DEBUG
+#endif
     
     if (file_len != file_len_in_header) {
         ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "the file's size does not match the \"Content-Length\" domain");
@@ -449,7 +450,7 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
     return 0;
 }
 
-/* input:file_content and file_len, file_content ending with '\n' */
+/* input:file_content and file_len, file_content must end with '\n' */
 /* output:p_ipsubnet_list */
 static apr_status_t get_ipsubnet_list_from_file_content (apr_pool_t *mp, char *file_content, apr_int64_t file_len, apr_array_header_t *p_ipsubnet_list)
 {
@@ -497,68 +498,74 @@ static int ip_in_ipsubnet_list_test (apr_sockaddr_t *ip_to_be_test, apr_array_he
     return 0;
 }
 
+/* update expired data */
+/* input hostname, port and filepath */
+/* return 0 means OK, return -1 means ERROR */
+static int update_expired_data (request_rec *r, char *hostname, apr_int64_t port, char *filepath, apr_time_t *p_last_update_time, auth_remote_svr_conf *svr_conf)
+{
+    apr_status_t rv;
+    apr_pool_t *mp = r -> pool;
+    apr_socket_t *s;
+    apr_sockaddr_t *sa;
+    apr_int64_t file_len;
+    char *file_content;
+    char errmsg_buf[120];
+
+        /* update last_update_time */
+    *p_last_update_time = apr_time_now ();
+
+        /* clear the subprocess pool for preventing leakage */
+    apr_pool_clear (svr_conf -> subpool);
+    svr_conf -> p_ipsubnet_list = apr_array_make (svr_conf -> subpool, 0, sizeof (apr_ipsubnet_t*));
+        
+        /* build connection */
+    rv = build_connection (r, hostname, port, filepath, &s, &sa);
+    if (rv != APR_SUCCESS) {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "%s", errmsg_buf);
+        return -1;
+    }
+
+        /* get file content from url */
+    if (get_file_content_from_url (r, s, sa, filepath, &file_content, &file_len) == -1) {
+        return -1;
+    }
+
+#ifdef DEBUG
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_content: %s", file_content);
+#endif
+
+        /* get the ipsubnet_list and update it with file_content*/
+    rv = get_ipsubnet_list_from_file_content (svr_conf -> subpool, file_content, file_len, svr_conf -> p_ipsubnet_list);
+    if (rv != APR_SUCCESS) {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "%s", errmsg_buf);
+        return -1;
+    }
+    return 0;
+}
+
 static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, char *hostname, apr_int64_t port, char *filepath, apr_time_t *p_last_update_time, apr_time_t expire_time)
 {
     apr_status_t rv;
     apr_pool_t *mp = r -> pool;
-    auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);
-    
+    auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);   
     char errmsg_buf[120];
 
-    #ifdef DEBUG
+#ifdef DEBUG
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "hostname: %s", hostname);
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "filepath: %s", filepath);
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "port: %lld", port);
-    #endif DEBUG
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "cur_time: %lld", apr_time_now ());
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "last_update_time: %lld", *p_last_update_time);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "expire_time: %lld", expire_time);
+#endif
 
     if (apr_time_now () - *p_last_update_time > expire_time) { /* the ip-list from url is expired */
-
-        #ifdef DEBUG
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "cur_time: %lld", apr_time_now ());
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "last_update_time: %lld", *p_last_update_time);
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "expire_time: %lld", expire_time);
-        #endif DEBUG
-        
-            /* update last_update_time */
-        *p_last_update_time = apr_time_now ();
-
-            /* clear the subprocess pool for preventing leakage */
-        apr_pool_clear (svr_conf -> subpool);
-        svr_conf -> p_ipsubnet_list = apr_array_make (svr_conf -> subpool, 0, sizeof (apr_ipsubnet_t*));
-
-        apr_socket_t *s;
-        apr_sockaddr_t *sa;
-        
-            /* build connection */
-        rv = build_connection (r, hostname, port, filepath, &s, &sa);
-        if (rv != APR_SUCCESS) {
-            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "%s", errmsg_buf);
+        if (update_expired_data (r, hostname, port, filepath, p_last_update_time, svr_conf) == -1) {
             return 0;
-        }
-
-            /* get file content from url */
-        apr_int64_t file_len;
-        char *file_content;
-        if (get_file_content_from_url (r, s, sa, filepath, &file_content, &file_len) == -1) {
-            return 0;
-        }
-
-        #ifdef DEBUG
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_content: %s", file_content);
-        #endif DEBUG
-
-            /* get the ipsubnet_list and update it with file_content*/
-        rv = get_ipsubnet_list_from_file_content (svr_conf -> subpool, file_content, file_len, svr_conf -> p_ipsubnet_list);
-        if (rv != APR_SUCCESS) {
-            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "%s", errmsg_buf);
         }
     }
-
-    #ifdef DEBUG
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "ipsubnet_list_num: %d\n", svr_conf -> p_ipsubnet_list -> nelts);
-    #endif DEBUG
 
         /* check if the request's ip is match one of the ipsubnets getting from url */
     return ip_in_ipsubnet_list_test (ip_to_be_test, svr_conf -> p_ipsubnet_list);
@@ -704,8 +711,6 @@ static void child_init (apr_pool_t *pchild, server_rec *s)
                       "Failed to create mutex for auth_remote_module");
         return;
     }
-
-    svr_conf -> p_ipsubnet_list = apr_array_make (svr_conf -> subpool, 0, sizeof (apr_ipsubnet_t*));
 #endif
 }
 
