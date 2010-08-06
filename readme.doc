@@ -44,7 +44,7 @@ ip地址列表必须每行表示一个ip，格式与在allow指令后面跟的ip
 
 例子：
 <Location /foo/bar>
-Remote_expire_time 300
+Remote_expire_time 3
 Remote_order deny,allow
 Remote_deny from all
 Remote_allow from url=http://manager.domain.com/access/list.txt
