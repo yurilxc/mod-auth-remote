@@ -48,7 +48,7 @@
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #define CRLF_STR "\r\n"
-#define DEF_SOCK_TIMEOUT (APR_USEC_PER_SEC * 4)
+#define DEF_SOCK_TIMEOUT (APR_USEC_PER_SEC * 1)
 #define DEF_PORT_NUM 80
 /* realtime*/
 #define DEF_EXPIRE_TIME 0
@@ -414,6 +414,10 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
     }
     file_len = strlen (p_blank_line_following_header + 2);
     if (file_len > file_len_in_header) {
+#ifdef DEBUG
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "\"Content-Length\": %lld", file_len_in_header);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "accept len: %lld", file_len);
+#endif
         ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "the file's size does not match the \"Content-Length\" domain");
         return -1;
     }
@@ -439,8 +443,12 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_len_in_header: %lld", file_len_in_header);
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_len: %lld", file_len);
 #endif
-    
+
     if (file_len != file_len_in_header) {
+#ifdef DEBUG
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "\"Content-Length\": %lld", file_len_in_header);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "accept len: %lld", file_len);
+#endif
         ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "the file's size does not match the \"Content-Length\" domain");
         return -1;
     }
@@ -452,13 +460,14 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
 
 /* input:file_content and file_len, file_content must end with '\n' */
 /* output:p_ipsubnet_list */
-static apr_status_t get_ipsubnet_list_from_file_content (apr_pool_t *mp, char *file_content, apr_int64_t file_len, apr_array_header_t *p_ipsubnet_list)
+static void get_ipsubnet_list_from_file_content (apr_pool_t *mp, char *file_content, apr_int64_t file_len, apr_array_header_t **p_ipsubnet_list)
 {
     int i, j, k;
     apr_status_t rv;
     char *tp;
     apr_ipsubnet_t **pip;
 
+    *p_ipsubnet_list = apr_array_make (mp, 0, sizeof (apr_ipsubnet_t*));
     for (i = j = 0; i <= file_len; i++) {
         if (file_content[i] == '\r' || file_content[i] == '\n') {
             for (k = j; k < i; k++) {
@@ -467,7 +476,7 @@ static apr_status_t get_ipsubnet_list_from_file_content (apr_pool_t *mp, char *f
             }
             /*be sure not a blank line */
             if (k < i) {
-                pip = apr_array_push (p_ipsubnet_list);
+                pip = apr_array_push (*p_ipsubnet_list);
                 file_content[i] = '\0';
                 if (tp = ap_strchr (file_content + j, '/')) {
                     *tp++ = '\0';
@@ -476,26 +485,13 @@ static apr_status_t get_ipsubnet_list_from_file_content (apr_pool_t *mp, char *f
                 else {
                     rv = apr_ipsubnet_create (pip, file_content + j, NULL, mp);
                 }
-                if (rv != APR_SUCCESS)
-                    return rv;
+                if (rv != APR_SUCCESS) {
+                    apr_array_pop (*p_ipsubnet_list);
+                }
             }
             j = i + 1;
         }
     }
-    return APR_SUCCESS;
-}
-
-/* input:ip_to_be_test, p_ipsubnet_list */
-/* return 1 means match, 0 means error or unmatch */
-static int ip_in_ipsubnet_list_test (apr_sockaddr_t *ip_to_be_test, apr_array_header_t *p_ipsubnet_list)
-{
-    int i, len = p_ipsubnet_list -> nelts;
-    apr_ipsubnet_t **p_ipsubnet = (apr_ipsubnet_t **) p_ipsubnet_list -> elts;
-    for (i = 0; i < len; i++) {
-        if (apr_ipsubnet_test (p_ipsubnet[i], ip_to_be_test))
-            return 1;
-    }
-    return 0;
 }
 
 /* update expired data */
@@ -511,13 +507,6 @@ static int update_expired_data (request_rec *r, char *hostname, apr_int64_t port
     char *file_content;
     char errmsg_buf[120];
 
-        /* update last_update_time */
-    *p_last_update_time = apr_time_now ();
-
-        /* clear the subprocess pool for preventing leakage */
-    apr_pool_clear (svr_conf -> subpool);
-    svr_conf -> p_ipsubnet_list = apr_array_make (svr_conf -> subpool, 0, sizeof (apr_ipsubnet_t*));
-        
         /* build connection */
     rv = build_connection (r, hostname, port, filepath, &s, &sa);
     if (rv != APR_SUCCESS) {
@@ -535,12 +524,29 @@ static int update_expired_data (request_rec *r, char *hostname, apr_int64_t port
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_content: %s", file_content);
 #endif
 
-        /* get the ipsubnet_list and update it with file_content*/
-    rv = get_ipsubnet_list_from_file_content (svr_conf -> subpool, file_content, file_len, svr_conf -> p_ipsubnet_list);
-    if (rv != APR_SUCCESS) {
-        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "%s", errmsg_buf);
-        return -1;
+        /* update last_update_time */
+    *p_last_update_time = apr_time_now ();
+
+        /* clear the subprocess pool for preventing leakage */
+    apr_pool_clear (svr_conf -> subpool);
+
+        /* get the ipsubnet_list from file_content*/
+    get_ipsubnet_list_from_file_content (svr_conf -> subpool, file_content, file_len, &(svr_conf -> p_ipsubnet_list));
+
+    return 0;
+}
+
+/* input:ip_to_be_test, p_ipsubnet_list */
+/* return 1 means match, 0 means error or unmatch */
+static int ip_in_ipsubnet_list_test (apr_sockaddr_t *ip_to_be_test, apr_array_header_t *p_ipsubnet_list)
+{
+    if (!p_ipsubnet_list)
+        return 0;
+    int i, len = p_ipsubnet_list -> nelts;
+    apr_ipsubnet_t **p_ipsubnet = (apr_ipsubnet_t **) p_ipsubnet_list -> elts;
+    for (i = 0; i < len; i++) {
+        if (apr_ipsubnet_test (p_ipsubnet[i], ip_to_be_test))
+            return 1;
     }
     return 0;
 }
@@ -563,7 +569,7 @@ static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, char *
 
     if (apr_time_now () - *p_last_update_time > expire_time) { /* the ip-list from url is expired */
         if (update_expired_data (r, hostname, port, filepath, p_last_update_time, svr_conf) == -1) {
-            return 0;
+                   ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "fail to update expired data, the ipsubnet_list remains unchanged, but last_update_time changes, after expire_time next update will be invoked by another request");
         }
     }
 
@@ -678,12 +684,8 @@ static int check_dir_access(request_rec *r)
         }
     }
 
-    if (ret == HTTP_FORBIDDEN
-        && (ap_satisfies(r) != SATISFY_ANY || !ap_some_auth_required(r))) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
-            "client denied by server configuration: %s%s",
-            r->filename ? "" : "uri ",
-            r->filename ? r->filename : r->uri);
+    if (ret == HTTP_FORBIDDEN && (ap_satisfies(r) != SATISFY_ANY || !ap_some_auth_required(r))) {
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "client denied by auth_remote_module: %s%s", r->filename ? "" : "uri ", r->filename ? r->filename : r->uri);
     }
 
     return ret;
@@ -701,6 +703,8 @@ static void child_init (apr_pool_t *pchild, server_rec *s)
         ap_log_perror (APLOG_MARK, APLOG_CRIT, rv, pchild, "Failed to create subpool for auth_remote_module");
         return ;
     }
+
+    svr_conf -> p_ipsubnet_list = apr_array_make (svr_conf -> subpool, 0, sizeof (apr_ipsubnet_t *));
 
         /* create mutex */
 #ifdef APR_HAS_THREADS
