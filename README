@@ -29,7 +29,7 @@ remote_allow from url=url_name
 url_name是一个合法的url，提供一个ip地址列表。
 模块判断当前request的ip地址是否在url提供的ip列表中，如果在列表中，对remote_allow来说表示允许访问，对remote_deny则表示不允许访问，实际最终判断结果要结合remote_order来判断。
 
-b)remote_expire_time用于设置URL的失效时间，是一个非负整数，单位是秒，不设置时默认为0秒。如果两次http访问的间隔大于这个时间，那么URL中的ip信息会被重新读取。如果间隔小于失效时间，ip信息可能不变（也可能会重新读取，由Apache的核心模块如何进行进程管理决定）。
+b)remote_expire_time用于设置URL的失效时间，是一个非负整数，单位是秒，不设置时默认为0秒，最大为1000000000秒。如果两次http访问的间隔大于这个时间，那么URL中的ip信息会被重新读取。如果间隔小于失效时间，ip信息可能不变（也可能会重新读取，由Apache的核心模块如何进行进程管理决定）。
 
 2.在url指向的配置文件中的ip：
 ip地址列表必须每行表示一个ip，格式与在allow指令后面跟的ip地址参数一样。

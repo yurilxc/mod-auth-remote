@@ -40,9 +40,8 @@
 #include <netinet/in.h>
 #endif
 
-#define DEBUG
 #include <stdio.h>
-#define BUF_SIZE 1024
+#define BUF_SIZE 4096
 #define FILE_SIZE ((17 + 1) * (20000 + 10) + BUF_SIZE)
 #define HEADER_SIZE (4096 + BUF_SIZE)
 #define MIN(a,b) ((a)<(b)?(a):(b))
@@ -150,6 +149,9 @@ static const char *expire_time_cmd (cmd_parms *cmd, void *dv, const char *s_expi
     apr_time_t ttime = 0;
     for (i = 0; i < len; i++) {
         if (s_expire_time[i] <= '9' && s_expire_time[i] >= '0') {
+            if (ttime > (1000000000 - (apr_time_t)(s_expire_time[i] - '0')) / 10) {
+                return "the expire time is too large (maximum: 1000000000)";
+            }
             ttime = ttime * 10 + (apr_time_t)(s_expire_time[i] - '0');
         }
         else {
@@ -341,7 +343,7 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
     rv = apr_socket_send (s, req_msg, &len);
     if (rv != APR_SUCCESS) {
         apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "%s", errmsg_buf);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "could not send the request to url: %s", errmsg_buf);
         return -1;
     }
 
@@ -352,12 +354,17 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
     while (1) {
         len = BUF_SIZE;
         if (header_len + len >= HEADER_SIZE) {
-            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "the header size is too large.");
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the http header's size is too large.");
             return -1;
         }
         rv = apr_socket_recv (s, nheader, &len);
+        if (rv == APR_EOF || len == 0) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "cannot get compelte http head (maybe the server is too busy)");
+            return -1;
+        }
         if (header_len == 0 && strncmp (header, CRLF_STR, 2) == 0) {
-            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "the header does not cotain \"Content-Length\" domain.");
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "the http header does not cotain \"Content-Length\" domain.");
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the file from url is not valid");
             return -1;
         }
         for (i = 2, lab = 0; i < header_len + len; i++) {
@@ -380,24 +387,33 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
     header[header_len] = '\0';
     p_blank_line_following_header += 2;
     *p_blank_line_following_header = '\0';
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "header: %s", header);
+    if (strncmp (header, "HTTP/1.0", 8) == 0) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "status line: %s", header + 9);
+    }
+    else if (strncmp (header, "HTTP/1.1", 8) == 0) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "status line: %s", header + 9);
+    }
     for (nheader = header; *nheader != '\0'; nheader++) {
         if (strncmp (nheader, "Content-Length", 14) == 0)
             break;
     }
     if (*nheader == '\0') {
-        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "the header does not cotain \"Content-Length\" domain.");
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "the http header does not cotain \"Content-Length\" domain.");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the file from url is not valid");
         return -1;
     }
     else {
         nheader = ap_strchr (nheader, ':');
         if (!nheader) {
-            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "the header does not cotain \"Content-Length\" domain.");
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "the header does not cotain \"Content-Length\" domain.");
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "The url does not point to a valid ip-list file");
             return -1;
         }
         else {
             char *tp = ap_strchr (nheader, '\r');
             if (!tp) {
-                ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "an unkown bug");
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "an unkown bug");
                 return -1;
             }
             *tp = '\0';
@@ -405,20 +421,15 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
             *tp = '\r';
         }
     }
-    #ifdef DEBUG
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Content-Length: %lld", file_len_in_header);
-    #endif
     if (file_len_in_header >= FILE_SIZE) {
-        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "the file from url is too large");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the file from url is too large");
         return -1;
     }
     file_len = strlen (p_blank_line_following_header + 2);
     if (file_len > file_len_in_header) {
-#ifdef DEBUG
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "\"Content-Length\": %lld", file_len_in_header);
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "accept len: %lld", file_len);
-#endif
-        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "the file's size does not match the \"Content-Length\" domain");
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "\"Content-Length\": %lld | accept len: %lld", file_len_in_header, file_len);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to get complete content of the file");
         return -1;
     }
     file_content = apr_palloc (mp, file_len_in_header + BUF_SIZE);
@@ -438,18 +449,11 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
             break;
     }
     
-#ifdef DEBUG
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_content: %s", file_content);
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_len_in_header: %lld", file_len_in_header);
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_len: %lld", file_len);
-#endif
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_content: %s | file_len_in_header: %lld, file_len: %lld", file_content, file_len_in_header, file_len);
 
     if (file_len != file_len_in_header) {
-#ifdef DEBUG
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "\"Content-Length\": %lld", file_len_in_header);
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "accept len: %lld", file_len);
-#endif
-        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "the file's size does not match the \"Content-Length\" domain");
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "\"Content-Length\": %lld | accept len: %lld", file_len_in_header, file_len);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to get complete content of the file");
         return -1;
     }
     file_content[file_len] = '\n';
@@ -460,16 +464,19 @@ static int get_file_content_from_url (request_rec *r, apr_socket_t *s, apr_socka
 
 /* input:file_content and file_len, file_content must end with '\n' */
 /* output:p_ipsubnet_list */
-static void get_ipsubnet_list_from_file_content (apr_pool_t *mp, char *file_content, apr_int64_t file_len, apr_array_header_t **p_ipsubnet_list)
+static void get_ipsubnet_list_from_file_content (request_rec *r, apr_pool_t *mp, char *file_content, apr_int64_t file_len, apr_array_header_t **p_ipsubnet_list)
 {
     int i, j, k;
+    int cr = 0, cn = 0;
     apr_status_t rv;
     char *tp;
     apr_ipsubnet_t **pip;
+    char errmsg_buf[120];
 
     *p_ipsubnet_list = apr_array_make (mp, 0, sizeof (apr_ipsubnet_t*));
     for (i = j = 0; i <= file_len; i++) {
         if (file_content[i] == '\r' || file_content[i] == '\n') {
+            file_content[i] == '\r' ? cr++ : cn++;
             for (k = j; k < i; k++) {
                 if (file_content[i] != ' ')
                     break;
@@ -487,6 +494,9 @@ static void get_ipsubnet_list_from_file_content (apr_pool_t *mp, char *file_cont
                 }
                 if (rv != APR_SUCCESS) {
                     apr_array_pop (*p_ipsubnet_list);
+                    apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "%s", errmsg_buf);
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "invalid ipsubnet address at line %d", MAX (cr, cn));
                 }
             }
             j = i + 1;
@@ -510,8 +520,9 @@ static int update_expired_data (request_rec *r, char *hostname, apr_int64_t port
         /* build connection */
     rv = build_connection (r, hostname, port, filepath, &s, &sa);
     if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "connection error");
         apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "%s", errmsg_buf);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "%s", errmsg_buf);
         return -1;
     }
 
@@ -520,9 +531,7 @@ static int update_expired_data (request_rec *r, char *hostname, apr_int64_t port
         return -1;
     }
 
-#ifdef DEBUG
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_content: %s", file_content);
-#endif
 
         /* update last_update_time */
     *p_last_update_time = apr_time_now ();
@@ -531,7 +540,7 @@ static int update_expired_data (request_rec *r, char *hostname, apr_int64_t port
     apr_pool_clear (svr_conf -> subpool);
 
         /* get the ipsubnet_list from file_content*/
-    get_ipsubnet_list_from_file_content (svr_conf -> subpool, file_content, file_len, &(svr_conf -> p_ipsubnet_list));
+    get_ipsubnet_list_from_file_content (r, svr_conf -> subpool, file_content, file_len, &(svr_conf -> p_ipsubnet_list));
 
     return 0;
 }
@@ -558,18 +567,12 @@ static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, char *
     auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);   
     char errmsg_buf[120];
 
-#ifdef DEBUG
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "hostname: %s", hostname);
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "filepath: %s", filepath);
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "port: %lld", port);
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "cur_time: %lld", apr_time_now ());
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "last_update_time: %lld", *p_last_update_time);
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "expire_time: %lld", expire_time);
-#endif
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "hostname: %s | filepath: %s | port: lld", hostname, filepath, port);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "cur_time: %lld | last_update_time: %lld | expire_time: %lld", apr_time_now (), *p_last_update_time, expire_time);
 
     if (apr_time_now () - *p_last_update_time > expire_time) { /* the ip-list from url is expired */
         if (update_expired_data (r, hostname, port, filepath, p_last_update_time, svr_conf) == -1) {
-                   ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "fail to update expired data, the ipsubnet_list remains unchanged, but last_update_time changes, after expire_time next update will be invoked by another request");
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update expired data, the ipsubnet_list remains unchanged, but last_update_time changes, after expire_time next update will be invoked by another request");
         }
     }
 
@@ -685,7 +688,7 @@ static int check_dir_access(request_rec *r)
     }
 
     if (ret == HTTP_FORBIDDEN && (ap_satisfies(r) != SATISFY_ANY || !ap_some_auth_required(r))) {
-        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "client denied by auth_remote_module: %s%s", r->filename ? "" : "uri ", r->filename ? r->filename : r->uri);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "client denied by auth_remote_module: %s%s", r->filename ? "" : "uri ", r->filename ? r->filename : r->uri);
     }
 
     return ret;
