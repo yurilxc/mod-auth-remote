@@ -64,10 +64,9 @@ enum allowdeny_type {
 
 typedef struct {
     apr_time_t last_contact_time;
-    char *p_last_update_time;
-    char *hostname;
-    apr_int64_t port;
-    char *filepath;
+    char *last_update_time;
+    char *last_update_url;
+    char *remote_url;
     apr_array_header_t *p_ipsubnet_list;/* an array including pointers to apr_ipsubnet_t */
     apr_pool_t *subpool;
 } REMOTE_INFO;
@@ -170,10 +169,11 @@ static const char *expire_time_cmd (cmd_parms *cmd, void *dv, const char *s_expi
 }
 
 /* seperate url to hostname, port and filepath */
-/* return -1 means error, an error message puts to stdout*/
-static int parse_url (apr_pool_t *mp, char *ori_remote_url, char **hostname, apr_int64_t *p_port_num, char **filepath)
+/* return -1 means error */
+static int parse_url (request_rec *r, char *ori_remote_url, char **hostname, apr_int64_t *p_port_num, char **filepath)
 {
-    char *remote_url = apr_pstrdup (mp, ori_remote_url);
+    apr_pool_t *rp = r -> pool;
+    char *remote_url = apr_pstrdup (rp, ori_remote_url);
     char *p_port_str;
     char *p_tmp;
 
@@ -185,11 +185,11 @@ static int parse_url (apr_pool_t *mp, char *ori_remote_url, char **hostname, apr
     p_tmp = ap_strchr (*hostname, '/');
     
     if (p_tmp) {
-        *filepath = apr_pstrdup (mp, p_tmp);
+        *filepath = apr_pstrdup (rp, p_tmp);
         *p_tmp = '\0';
     }
     else {
-        *filepath = apr_pstrdup (mp, "/");
+        *filepath = apr_pstrdup (rp, "/");
     }
 
     *p_port_num = DEF_PORT_NUM;
@@ -200,7 +200,7 @@ static int parse_url (apr_pool_t *mp, char *ori_remote_url, char **hostname, apr
     }
 
     if (errno == ERANGE) {
-        printf ("port number overflow\n");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "port number overflow");
         return -1;
     }
     return 0;
@@ -238,11 +238,10 @@ static const char *allow_cmd(cmd_parms *cmd, void *dv, const char *from,
     }
     else if (!strncasecmp (where, "url=", 4)){
         a->type = T_URL;
-        if (parse_url (cmd->pool, where + 4, &(a->x.remote_info.hostname), &(a->x.remote_info.port), &(a->x.remote_info.filepath)) == -1) {
-            return "reading url error";
-        }
         a->x.remote_info.last_contact_time = 0;
-        a->x.remote_info.p_last_update_time = NULL;
+        a->x.remote_info.last_update_time = NULL;
+        a->x.remote_info.last_update_url = NULL;
+        a->x.remote_info.remote_url = where + 4;
         a->x.remote_info.subpool = NULL;
         a->x.remote_info.p_ipsubnet_list = NULL;
     }
@@ -622,15 +621,17 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
     apr_pool_t *rp = r -> pool;
     apr_time_t cur_time = apr_time_now ();
     int redirect_cnt;
-    
-    char *hostname = apr_pstrdup (rp, p_remote_info -> hostname);
-    apr_int64_t port = p_remote_info -> port;
-    char *filepath = apr_pstrdup (rp, p_remote_info -> filepath);
+
+    char *now_url = apr_pstrdup (rp, p_remote_info -> remote_url);
+    char *hostname;
+    apr_int64_t port;
+    char *filepath;
     
     apr_status_t rv;
     apr_socket_t *s;
     apr_sockaddr_t *sa;
-    
+
+    char *req_msg;
     char header[HEADER_SIZE + 10], redundant[HEADER_SIZE + 10];
     apr_size_t hlen, rlen;
     char *status_code;
@@ -645,6 +646,15 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
 #endif
 
     for (redirect_cnt = 0; redirect_cnt <= MAX_REDIRECT_TIME; redirect_cnt++) {
+
+        if (parse_url (r, now_url, &hostname, &port, &filepath) == -1) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the module fail to get info from remote url, remote url in configuration file may be invalid.");
+#ifdef DEBUG
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to parse %s", now_url);
+#endif
+            return -1;
+        }
+
 
 #ifdef DEBUG
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "before build connection");
@@ -666,7 +676,7 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
         apr_socket_timeout_set (s, DEF_SOCK_TIMEOUT);
 
             /* send request */
-        char *req_msg = apr_pstrcat(rp, "GET ", filepath, " HTTP/1.0", CRLF_STR, "If-Modified-Since: ", p_remote_info -> p_last_update_time, CRLF_STR, CRLF_STR, NULL);
+        req_msg = apr_pstrcat(rp, "GET ", filepath, " HTTP/1.0", CRLF_STR, "If-Modified-Since: ", p_remote_info -> last_update_time, CRLF_STR, CRLF_STR, NULL);
         len = strlen (req_msg);
         rv = apr_socket_send (s, req_msg, &len);
         if (rv != APR_SUCCESS) {
@@ -695,7 +705,7 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "status code: %s", status_code);
 #endif
         
-        if (strcmp (status_code, "200") == 0) {/* need to be update */
+        if (strcmp (status_code, "200") == 0 || (strcmp (status_code, "304") == 0 && strcmp (now_url, p_remote_info -> last_update_url) != 0)) {/* need to be update */
             if (get_content_length_from_header (r, header, hlen, FILE_SIZE, &expect_len) == -1)
                 return -1;
 
@@ -722,29 +732,24 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
             if (get_date_from_header (r, header, hlen, &ts) == -1) {
                 return -1;
             }
-            p_remote_info -> p_last_update_time = apr_pstrdup (p_remote_info -> subpool, ts);
+            p_remote_info -> last_update_time = apr_pstrdup (p_remote_info -> subpool, ts);
+                /* update last_update_url */
+            p_remote_info -> last_update_url = apr_pstrdup (p_remote_info -> subpool, now_url);
 
             apr_pool_clear (p_remote_info -> subpool);
             
                 /* get the ipsubnet_list from file_content*/
             file_content[flen] = '\n';
             get_ipsubnet_list_from_file_content (r, p_remote_info -> subpool, file_content, flen, &(p_remote_info -> p_ipsubnet_list));
+
             return 0;
         }
         else if (strcmp (status_code, "304") == 0) {/* not modified */
             return 0;
         }
         else if (strcmp (status_code, "300") == 0 || strcmp (status_code, "301") == 0 || strcmp (status_code, "302") == 0 || strcmp (status_code, "307") == 0) {/* redirect */
-            char *new_url;
-            if (get_location_from_header (r, header, hlen, &new_url) == -1) {
+            if (get_location_from_header (r, header, hlen, &now_url) == -1) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the module fail to get info from remote url, remote url in configuration file may be invalid.");
-                return -1;
-            }
-            if (parse_url (rp, new_url, &hostname, &port, &filepath) == -1) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the module fail to get info from remote url, remote url in configuration file may be invalid.");
-#ifdef DEBUG
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to parse redirect location: %s", new_url);
-#endif
                 return -1;
             }
             continue;
@@ -780,7 +785,7 @@ static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test,REMOTE_
     char errmsg_buf[120];
 
 #ifdef DEBUG
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "cur_time: %lld | last_contact_time: %lld | last_update_time: %s | expire_time: %lld", apr_time_now (), p_remote_info -> last_contact_time, p_remote_info -> p_last_update_time, expire_time);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "cur_time: %lld | last_contact_time: %lld | last_update_time: %s | expire_time: %lld", apr_time_now (), p_remote_info -> last_contact_time, p_remote_info -> last_update_time, expire_time);
 #endif
 
     if (apr_time_now () - p_remote_info -> last_contact_time > expire_time) { /* the ip-list from url is expired */
@@ -841,26 +846,26 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr
                     break;
                 }
             }
-            if (!ap[i].x.remote_info.p_last_update_time) { /* init last_update_time */
+            if (!ap[i].x.remote_info.last_update_time) { /* init last_update_time */
                 if (!ap[i].x.remote_info.subpool) {
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
 #ifdef DEBUG
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to initial p_last_update_time as the pool is NULL");
+                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to initial last_update_time as the pool is NULL");
 #endif
                     break;
                 }
-                ap[i].x.remote_info.p_last_update_time = apr_palloc (ap[i].x.remote_info.subpool, APR_RFC822_DATE_LEN);
-                rv = apr_rfc822_date (ap[i].x.remote_info.p_last_update_time, 0);
+                ap[i].x.remote_info.last_update_time = apr_palloc (ap[i].x.remote_info.subpool, APR_RFC822_DATE_LEN);
+                rv = apr_rfc822_date (ap[i].x.remote_info.last_update_time, 0);
                 if (rv != APR_SUCCESS) {
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
 #ifdef DEBUG
                     apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to initial p_last_update_time: %s", errmsg_buf);
+                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to initial last_update_time: %s", errmsg_buf);
 #endif
                     break;
                 }
 #ifdef DEBUG
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "init_last_update_time: %s", ap[i].x.remote_info.p_last_update_time);
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "init_last_update_time: %s", ap[i].x.remote_info.last_update_time);
 #endif
             }
             if (ip_in_url_test (r, r->connection->remote_addr, &ap[i].x.remote_info, expire_time) == 1) {
