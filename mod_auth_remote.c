@@ -522,7 +522,7 @@ static int get_date_from_header (request_rec *r, char *header, apr_size_t hlen, 
     int i, j;
     apr_pool_t *rp = r -> pool;
     for (i = 0; i + 5 <= hlen; i++)
-        if (strncmp (header + i, "Date: ", 5) == 0)
+        if (strncmp (header + i, "Date:", 5) == 0)
             break;
     if (i + 5 > hlen)  {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
@@ -540,6 +540,32 @@ static int get_date_from_header (request_rec *r, char *header, apr_size_t hlen, 
         return -1;
     }
     *date = apr_pstrmemdup (rp, header + i + 1, j - (i + 1));
+    return 0;
+}
+
+static int get_content_type_from_header (request_rec *r, char *header, apr_size_t hlen, char **content_type)
+{
+    int i, j;
+    apr_pool_t *rp = r -> pool;
+    for (i = 0; i + 13 <= hlen; i++)
+        if (strncmp (header + i, "Content-Type:", 13) == 0)
+            break;
+    if (i + 13 > hlen)  {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
+#ifdef DEBUG
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Content-Type unfound");
+#endif
+        return -1;
+    }
+    i += 13;
+    for (j = i; j < hlen; j++)
+        if (header[j] == '\r')
+            break;
+    if (j >= hlen) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
+        return -1;
+    }
+    *content_type = apr_pstrmemdup (rp, header + i + 1, j - (i + 1));
     return 0;
 }
 
@@ -609,6 +635,7 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
     apr_size_t hlen, rlen;
     char *status_code;
     apr_size_t expect_len;
+    char *content_type;
     char *file_content;
     apr_size_t flen;
     char *ts;
@@ -671,6 +698,16 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
         if (strcmp (status_code, "200") == 0) {/* need to be update */
             if (get_content_length_from_header (r, header, hlen, FILE_SIZE, &expect_len) == -1)
                 return -1;
+
+            if (get_content_type_from_header (r, header, hlen, &content_type) == -1)
+                return -1;
+#ifdef DEBUG
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "Content-Type: %s", content_type);
+#endif
+            if (strncasecmp (content_type, "text", 4) != 0) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the module fail to get info from remote url, remote url in configuration file may be invalid.");
+                return -1;
+            }
             
             file_content = apr_palloc (rp, expect_len + 2);
             if (get_body_from_response (r, s, expect_len, redundant, rlen, file_content, &flen) == -1)
