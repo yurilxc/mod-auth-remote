@@ -50,6 +50,7 @@
 #define DEF_SOCK_TIMEOUT (APR_USEC_PER_SEC * 1)
 #define DEF_PORT_NUM 80
 #define DEF_EXPIRE_TIME 0 /* realtime*/
+#define MAX_REDIRECT_TIME 50
 
 enum allowdeny_type {
     T_ENV,
@@ -616,7 +617,7 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "before loop");
 #endif
 
-    for (redirect_cnt = 0; redirect_cnt < 5; redirect_cnt++) {
+    for (redirect_cnt = 0; redirect_cnt <= MAX_REDIRECT_TIME; redirect_cnt++) {
 
 #ifdef DEBUG
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "before build connection");
@@ -717,7 +718,7 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
         }
     }
 
-    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the remote url redirects more than 5 times, auth_remote_module stop updating data from url to prevent infinite redirection loop");
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the remote url redirects too many times, auth_remote_module stop updating data from url to prevent infinite redirection loop");
     return -1;
 }
 
