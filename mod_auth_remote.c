@@ -359,7 +359,7 @@ static int get_header_from_response (request_rec *r, apr_socket_t *s, char *head
         }
         rv = apr_socket_recv (s, nheader, &len);
         if (strncmp (header, CRLF_STR, 2) == 0) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "unknown error");
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
             return -1;
         }
         for (i = 2; i < hlen + len; i++)
@@ -500,6 +500,7 @@ static int get_location_from_header (request_rec *r, char *header, apr_size_t hl
         if (strncmp (header + i, "Location:", 9) == 0)
             break;
     if (i + 9 > hlen) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
 #ifdef DEBUG
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "location unfound");
 #endif
@@ -663,11 +664,8 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
             /* build connection */
         rv = build_connection (r, hostname, port, &s, &sa);
         if (rv != APR_SUCCESS) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "connection error");
-#ifdef DEBUG
             apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "%s", errmsg_buf);
-#endif
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "connection error: %s", errmsg_buf);
             return -1;
         }
 
@@ -842,7 +840,7 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr
                 auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);
                 apr_status_t rv = apr_pool_create (&ap[i].x.remote_info.subpool, svr_conf -> subpool);
                 if (rv != APR_SUCCESS) {
-                    ap_log_rerror (APLOG_MARK, APLOG_CRIT, rv, r, "fail to create subpool for url");
+                    ap_log_rerror (APLOG_MARK, APLOG_ERR, rv, r, "fail to create subpool for url");
                     break;
                 }
             }
