@@ -170,14 +170,13 @@ static const char *expire_time_cmd (cmd_parms *cmd, void *dv, const char *s_expi
 
 /* seperate url to hostname, port and filepath */
 /* return -1 means error */
-static int parse_url (request_rec *r, char *ori_remote_url, char **hostname, apr_int64_t *p_port_num, char **filepath)
+static int parse_url (request_rec *r, const char *remote_url, char **hostname, apr_int64_t *p_port_num, char **filepath)
 {
     apr_pool_t *rp = r -> pool;
-    char *remote_url = apr_pstrdup (rp, ori_remote_url);
     char *p_port_str;
     char *p_tmp;
 
-    *hostname = remote_url;
+    *hostname = apr_pstrdup (rp, remote_url);
     if (!strncasecmp (*hostname, "http://", 7)) {
         *hostname += 7;
     }
@@ -217,7 +216,7 @@ static const char *allow_cmd(cmd_parms *cmd, void *dv, const char *from,
     apr_status_t rv;
 
     if (strcasecmp(from, "from"))
-        return "allow and deny must be followed by 'from'";
+        return "remote_allow and remote_deny must be followed by 'from'";
 
     a = (allowdeny *) apr_array_push(cmd->info ? d->allows : d->denys);
     a->x.from = where;
@@ -517,6 +516,7 @@ static int get_location_from_header (request_rec *r, char *header, apr_size_t hl
 }
 
 /* get the date value from http header, store in date */
+/* return -1 means error */
 static int get_date_from_header (request_rec *r, char *header, apr_size_t hlen, char **date)
 {
     int i, j;
@@ -525,7 +525,6 @@ static int get_date_from_header (request_rec *r, char *header, apr_size_t hlen, 
         if (strncmp (header + i, "Date:", 5) == 0)
             break;
     if (i + 5 > hlen)  {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
 #ifdef DEBUG
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "date unfound");
 #endif
@@ -646,6 +645,38 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "before loop");
 #endif
 
+    if (!(p_remote_info -> subpool)) { /* create subpool */
+        auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);
+        apr_status_t rv = apr_pool_create (&(p_remote_info -> subpool), svr_conf -> subpool);
+        if (rv != APR_SUCCESS) {
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "fail to create subpool for url: %s", errmsg_buf);
+            return -1;
+        }
+    }
+    if (!(p_remote_info -> last_update_time)) { /* init last_update_time */
+        if (!(p_remote_info -> subpool)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
+#ifdef DEBUG
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to initial last_update_time as the pool is NULL");
+#endif
+            return -1;
+        }
+        p_remote_info -> last_update_time = apr_palloc (p_remote_info -> subpool, APR_RFC822_DATE_LEN);
+        rv = apr_rfc822_date (p_remote_info -> last_update_time, 0);
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
+#ifdef DEBUG
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to initialize last_update_time: %s", errmsg_buf);
+#endif
+            return -1;
+        }
+#ifdef DEBUG
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "init_last_update_time: %s", p_remote_info -> last_update_time);
+#endif
+    }
+
     for (redirect_cnt = 0; redirect_cnt <= MAX_REDIRECT_TIME; redirect_cnt++) {
 
         if (parse_url (r, now_url, &hostname, &port, &filepath) == -1) {
@@ -695,7 +726,8 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
         header[hlen] = '\0';
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "header: %s", header);
 #endif
-            /* deal with different status_code */
+
+            /* get status code */
         if (get_status_code_from_header (r, header, hlen, &status_code) == -1)
             return -1;
 
@@ -703,7 +735,8 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "status code: %s", status_code);
 #endif
         
-        if (strcmp (status_code, "200") == 0 || (strcmp (status_code, "304") == 0 && strcmp (now_url, p_remote_info -> last_update_url) != 0)) {/* need to be update */
+            /* deal with different status_code */
+        if (strcmp (status_code, "200") == 0 || (strcmp (status_code, "304") == 0 && strcmp (now_url, p_remote_info -> last_update_url) != 0)) {/* need to update */
             if (get_content_length_from_header (r, header, hlen, FILE_SIZE, &expect_len) == -1)
                 return -1;
 
@@ -728,12 +761,16 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
 
                 /* update last_update_time */
             if (get_date_from_header (r, header, hlen, &ts) == -1) {
-                return -1;
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "date unfound");
+                p_remote_info -> last_update_time = NULL;
             }
-            p_remote_info -> last_update_time = apr_pstrdup (p_remote_info -> subpool, ts);
+            else {
+                p_remote_info -> last_update_time = apr_pstrdup (p_remote_info -> subpool, ts);
+            }
                 /* update last_update_url */
             p_remote_info -> last_update_url = apr_pstrdup (p_remote_info -> subpool, now_url);
 
+                /* clear the pool, preventing leakage */
             apr_pool_clear (p_remote_info -> subpool);
             
                 /* get the ipsubnet_list from file_content*/
@@ -805,7 +842,6 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr
     int i;
     int gothost = 0;
     const char *remotehost = NULL;
-    apr_status_t rv;
     char errmsg_buf[120];
 
     for (i = 0; i < a->nelts; ++i) {
@@ -836,36 +872,6 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr
             break;
 
         case T_URL:
-            if (!ap[i].x.remote_info.subpool) { /* create subpool for this directive */
-                auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);
-                apr_status_t rv = apr_pool_create (&ap[i].x.remote_info.subpool, svr_conf -> subpool);
-                if (rv != APR_SUCCESS) {
-                    ap_log_rerror (APLOG_MARK, APLOG_ERR, rv, r, "fail to create subpool for url");
-                    break;
-                }
-            }
-            if (!ap[i].x.remote_info.last_update_time) { /* init last_update_time */
-                if (!ap[i].x.remote_info.subpool) {
-                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
-#ifdef DEBUG
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to initial last_update_time as the pool is NULL");
-#endif
-                    break;
-                }
-                ap[i].x.remote_info.last_update_time = apr_palloc (ap[i].x.remote_info.subpool, APR_RFC822_DATE_LEN);
-                rv = apr_rfc822_date (ap[i].x.remote_info.last_update_time, 0);
-                if (rv != APR_SUCCESS) {
-                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
-#ifdef DEBUG
-                    apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to initial last_update_time: %s", errmsg_buf);
-#endif
-                    break;
-                }
-#ifdef DEBUG
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "init_last_update_time: %s", ap[i].x.remote_info.last_update_time);
-#endif
-            }
             if (ip_in_url_test (r, r->connection->remote_addr, &ap[i].x.remote_info, expire_time) == 1) {
                 return 1;
             }
@@ -951,8 +957,7 @@ static void child_init (apr_pool_t *pchild, server_rec *s)
     auth_remote_svr_conf *svr_conf = ap_get_module_config (s -> module_config, &auth_remote_module);
     rv = apr_pool_create(&(svr_conf->subpool), pchild);
     if (rv != APR_SUCCESS) {
-        ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, pchild,
-                      "Failed to create subpool for my_module");
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, pchild, "Failed to create subpool for my_module");
         return;
     }
 
