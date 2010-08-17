@@ -42,6 +42,7 @@
 
 #define DEBUG
 #include <stdio.h>
+#include <apr_version.h>
 #define FILE_SIZE ((17 + 1) * (20000 + 10))
 #define HEADER_SIZE (4096)
 #define MIN(a,b) ((a)<(b)?(a):(b))
@@ -95,7 +96,7 @@ typedef struct {
 
 typedef struct {
     apr_pool_t *subpool;
-#ifdef APR_HAS_THREADS
+#if APR_HAS_THREADS
     apr_thread_mutex_t *mutex;
 #endif
 } auth_remote_svr_conf;
@@ -323,7 +324,11 @@ static apr_status_t build_connection (request_rec *r, const char *hostname, cons
     rv = apr_sockaddr_info_get (psa, hostname, APR_INET, port, 0, rp);
     if (rv != APR_SUCCESS)
         return rv;
+#if APR_MAJOR_VERSION != 0
     rv = apr_socket_create (ps, (*psa) -> family, SOCK_STREAM, APR_PROTO_TCP, rp);
+#else
+    rv = apr_socket_create_ex (ps, (*psa) -> family, SOCK_STREAM, APR_PROTO_TCP, rp);
+#endif
     if (rv != APR_SUCCESS)
         return rv;
     rv = apr_socket_connect (*ps, *psa);
@@ -962,7 +967,7 @@ static void child_init (apr_pool_t *pchild, server_rec *s)
     }
 
         /* create mutex */
-#ifdef APR_HAS_THREADS
+#if APR_HAS_THREADS
     rv = apr_thread_mutex_create(&svr_conf->mutex,
                                  APR_THREAD_MUTEX_DEFAULT, pchild);
     if (rv != APR_SUCCESS) {

@@ -1,13 +1,13 @@
 模块名：
-mod_auth_remote
+auth_remote_module
 
 描述：
-通过简单的配置，远程api调用，来完成认证。
-实际情况中我们碰到这样的问题： 有N台服务器，需要限制只能被某些固定的ip访问。通常的方法就是在apache配置文件中写上某些ip列表。但是这些ip又是在变化的，我们不可能老是去更新N个服务器上的配置。 这些ip由某一个系统管理，并且可以通过某一URL发布出来。
+通过简单的配置，来完成认证。
+实际情况中我们碰到这样的问题：有N台服务器，需要限制只能被某些固定的ip访问。通常的方法就是在apache配置文件中写上某些ip列表。但是这些ip又是在变化的，我们不可能老是去更新N个服务器上的配置。这些ip由某一个系统管理，并且可以通过某一URL发布出来。
 所以我们希望有一个模块，来完成这样的认证过程，通过实时（或每隔一段时间）获取URL中的ip信息，来确定目标ip是否可以访问。 我们的需求对于访问速度要求不高，所以尽管最坏情况可能每次访问都会有一次http调用，但这是完全可接受的。 
 
 要求：
-Apache 2.x (tested with 2.2.15)
+Apache 2.x (tested with 2.2.15 with MPM module prefork)
 
 安装：
 1.编辑makefile中的APCAEH_ROOT的值为Apache的路径。
@@ -17,27 +17,29 @@ Apache 2.x (tested with 2.2.15)
 5.可以用make claen清除中间文件。
 
 配置：
-1.在httpd.conf中的配置指令：
-支持以下指令：
+1.安装成功后，使用LoadModule指令加载模块（具体参照Apache文档中关于LoadModule指令的说明和例子）。
+2.支持以下指令：
 remote_order
 remote_allow
 remote_deny
 remote_expire_time
 
-a)remote_order, remote_allow, remote_deny使用方法和与Apache原本的指令order，allow，deny分别对应，可兼容order，allow，deny支持的功能，唯一不同的是remote_allow和remote_deny增加了如下功能：
+a)remote_order, remote_allow, remote_deny使用方法和与Apache默认的指令order，allow，deny分别对应，可兼容order，allow，deny支持的功能，唯一不同的是remote_allow和remote_deny增加了如下功能：
 remote_allow from url=url_name
 url_name是一个合法的url，提供一个ip地址列表。
-模块判断当前request的ip地址是否在url提供的ip列表中，如果在列表中，对remote_allow来说表示允许访问，对remote_deny则表示不允许访问，实际最终判断结果要结合remote_order来判断。
+模块判断当前request的ip地址是否在url提供的ip列表中，如果在列表中，对remote_allow来说表示允许访问，对remote_deny则表示不允许访问，实际最终判断结果要结合remote_order来判断，判断规则与默认的指令中order指令一样。
 
 b)remote_expire_time用于设置URL的失效时间，是一个非负整数，单位是秒，不设置时默认为0秒，最大为1000000000秒。如果两次http访问的间隔大于这个时间，那么URL中的ip信息会被重新读取。如果间隔小于失效时间，ip信息可能不变（也可能会重新读取，由Apache的核心模块如何进行进程管理决定）。
 
-2.在url指向的配置文件中的ip：
+c)配置指令大小写不敏感。
+
+3.在url指向的配置文件中的ip：
 ip地址列表必须每行表示一个ip，格式与在allow指令后面跟的ip地址参数一样。
 
 注意：
 1.如果运行时发现有问题，日志中会输出一些可能有用的、等级为ERROR的信息（可能是配置时URL写错或者URL指向的文件的ip地址格式有问题，或者是URL指向的文件太大等等）。
-2.URL格式错误或者地址错误时，不匹配任何ip地址(相当于没写这条指令)。
-3.ip地址格式写错时（比如空行）不匹配任何ip地址（效果等价于没写这一行）。
+2.URL格式错误、地址错误或者指向的页面不合法（例如不是文本格式，或者远程服务器崩溃）时，不匹配任何ip地址(相当于没写这条指令)。
+3.ip地址格式写错时（比如空行，不合法字符等）不匹配任何ip地址（效果等价于没写这一行）。
 4.尽量不要因为写错了格式也对结果没影响就写格式错误的指令，这样会令日志输出无用的信息，也可能会引起潜在的bug。
 5.url指向的ip地址列表大小不能超过350000字节(假如每条ip地址约16字节，相当于约20000条ip地址)，如果大小超过限制，日志会输出提示信息。
 6.remote_expire_time指令的参数必须是一个非负整数，不能是负数和其他字符，否则认为是配置文件语法错误，Apache将无法启动并输出错误信息。该值为0的时候即相当于对于每次请求实时读取url。该指令与order指令一样，只能设置一次，设置多次的后果与设置多次order指令的后果一样。
@@ -45,12 +47,15 @@ ip地址列表必须每行表示一个ip，格式与在allow指令后面跟的ip
 8.如果URL指向的地址连续重定向超过50次，会被认为是循环重定向而不能获得更新。
 
 例子：
+1.加载auth_remote_module模块
+LoadModule auth_remote_module modules/mod_auth_remote.so
+2.配置限制特定ip对/foo/bar目录的访问
 <Location /foo/bar>
-Remote_expire_time 3
-Remote_order deny,allow
-Remote_deny from all
-Remote_allow from url=http://manager.domain.com/access/list.txt
-Remote_allow from url=manager.domain.com:8080/xxx.txt
+remote_expire_time 3
+remote_order deny,allow
+remote_deny from all
+remote_allow from url=http://manager.domain.com/access/list.txt
+remote_allow from url=manager.domain.com:8080/xxx.txt
 </Location>
 list.txt中内容可以为
 192.168.2.111
@@ -58,8 +63,9 @@ list.txt中内容可以为
 192.168.3
 xxx.txt内容为
 10.0.0.1
-那么只有ip地址为192.168.2.111，192.168.23.87，10.0.0.1，和192.168.3.xxx（xxx表示任意可以和前面的串组成合法ip地址的串）的request被允许访问/foo/bar。
+那么只有ip地址为192.168.2.111，192.168.23.87，10.0.0.1，和192.168.3.xxx（xxx表示任意可以和前面的串组成合法ip地址的串）的请求被允许访问/foo/bar，每次更新后3秒内本地ip列表会失效，此时遇到新请求会重新更新。
 
 BUG：
 1.网络繁忙时可能ip列表一直得不到更新。
 2.如果URL频繁重定向到不同的页面（可能为了负载均衡等原因），那么模块效率会降低。
+3.如果使用多线程的MPM模块（比如worker），会出现不可预料的错误。
