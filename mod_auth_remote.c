@@ -43,6 +43,7 @@
 #define DEBUG
 #include <stdio.h>
 #include <apr_version.h>
+#include <apr_thread_rwlock.h>
 #define FILE_SIZE ((17 + 1) * (20000 + 10))
 #define HEADER_SIZE (4096)
 #define MIN(a,b) ((a)<(b)?(a):(b))
@@ -70,6 +71,9 @@ typedef struct {
     char *remote_url;
     apr_array_header_t *p_ipsubnet_list;/* an array including pointers to apr_ipsubnet_t */
     apr_pool_t *subpool;
+#if APR_HAS_THREADS
+    apr_thread_rwlock_t *rwlock;
+#endif
 } REMOTE_INFO;
 
 typedef struct {
@@ -98,7 +102,7 @@ typedef struct {
     apr_pool_t *subpool;
 #if APR_HAS_THREADS
     apr_thread_mutex_t *mutex;
-#endif
+#endif    
 } auth_remote_svr_conf;
 
 module AP_MODULE_DECLARE_DATA auth_remote_module;
@@ -244,6 +248,9 @@ static const char *allow_cmd(cmd_parms *cmd, void *dv, const char *from,
         a->x.remote_info.remote_url = where + 4;
         a->x.remote_info.subpool = NULL;
         a->x.remote_info.p_ipsubnet_list = NULL;
+#if APR_HAS_THREADS
+        a->x.remote_info.rwlock = NULL;
+#endif
     }
     else if ((s = ap_strchr(where, '/'))) {
         *s++ = '\0';
@@ -650,38 +657,6 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "before loop");
 #endif
 
-    if (!(p_remote_info -> subpool)) { /* create subpool */
-        auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);
-        apr_status_t rv = apr_pool_create (&(p_remote_info -> subpool), svr_conf -> subpool);
-        if (rv != APR_SUCCESS) {
-            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-            ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "fail to create subpool for url: %s", errmsg_buf);
-            return -1;
-        }
-    }
-    if (!(p_remote_info -> last_update_time)) { /* init last_update_time */
-        if (!(p_remote_info -> subpool)) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
-#ifdef DEBUG
-            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to initial last_update_time as the pool is NULL");
-#endif
-            return -1;
-        }
-        p_remote_info -> last_update_time = apr_palloc (p_remote_info -> subpool, APR_RFC822_DATE_LEN);
-        rv = apr_rfc822_date (p_remote_info -> last_update_time, 0);
-        if (rv != APR_SUCCESS) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "internal error");
-#ifdef DEBUG
-            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "fail to initialize last_update_time: %s", errmsg_buf);
-#endif
-            return -1;
-        }
-#ifdef DEBUG
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "init_last_update_time: %s", p_remote_info -> last_update_time);
-#endif
-    }
-
     for (redirect_cnt = 0; redirect_cnt <= MAX_REDIRECT_TIME; redirect_cnt++) {
 
         if (parse_url (r, now_url, &hostname, &port, &filepath) == -1) {
@@ -691,7 +666,6 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
 #endif
             return -1;
         }
-
 
 #ifdef DEBUG
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "before build connection");
@@ -748,7 +722,7 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
             if (get_content_type_from_header (r, header, hlen, &content_type) == -1)
                 return -1;
 #ifdef DEBUG
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "Content-Type: %s", content_type);
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Content-Type: %s", content_type);
 #endif
             if (strncasecmp (content_type, "text", 4) != 0) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the module fail to get info from remote url, remote url in configuration file may be invalid.");
@@ -819,7 +793,7 @@ static int ip_in_ipsubnet_list_test (apr_sockaddr_t *ip_to_be_test, apr_array_he
     return 0;
 }
 
-static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test,REMOTE_INFO *p_remote_info, apr_time_t expire_time)
+static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, REMOTE_INFO *p_remote_info, apr_time_t expire_time)
 {
     apr_status_t rv;
     char errmsg_buf[120];
@@ -828,7 +802,46 @@ static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test,REMOTE_
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "cur_time: %lld | last_contact_time: %lld | last_update_time: %s | expire_time: %lld", apr_time_now (), p_remote_info -> last_contact_time, p_remote_info -> last_update_time, expire_time);
 #endif
 
-    if (apr_time_now () - p_remote_info -> last_contact_time > expire_time) { /* the ip-list from url is expired */
+#if APR_HAS_THREADS
+    if (apr_time_now () - p_remote_info -> last_contact_time >= expire_time) { /* the ip-list from url is expired */
+        p_remote_info -> last_contact_time = apr_time_now ();
+        rv = apr_thread_rwlock_wrlock (p_remote_info -> rwlock);
+        if (rv != APR_SUCCESS) {
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to obtain wrlock: %s", errmsg_buf);
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update expired data, the ipsubnet-list remains unchanged, after remote_expire_time next update will be invoked by another request");
+        }
+        else {
+                /* rejudge whether it is necessary to update */
+            if (apr_time_now () - p_remote_info -> last_contact_time >= expire_time) {
+                if (update_expired_data_from_remote_info (r, p_remote_info) == -1) {
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update expired data, the ipsubnet-list remains unchanged, after remote_expire_time next update will be invoked by another request");
+                }
+            }
+            rv = apr_thread_rwlock_unlock (p_remote_info -> rwlock);
+            if (rv != APR_SUCCESS) {
+                apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to release wrlock: %s", errmsg_buf);
+            }
+        }
+    }
+
+    rv = apr_thread_rwlock_rdlock (p_remote_info -> rwlock);
+    if (rv != APR_SUCCESS) {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to obtain rdlock: %s", errmsg_buf);
+    }
+        /* check if the request's ip is match one of the ipsubnets getting from url */
+    int ret = ip_in_ipsubnet_list_test (ip_to_be_test, p_remote_info -> p_ipsubnet_list);
+    rv = apr_thread_rwlock_unlock (p_remote_info -> rwlock);
+    if (rv != APR_SUCCESS) {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to release rdlock: %s", errmsg_buf);
+    }
+    return ret;
+
+#else
+    if (apr_time_now () - p_remote_info -> last_contact_time >= expire_time) { /* the ip-list from url is expired */
         p_remote_info -> last_contact_time = apr_time_now ();
         if (update_expired_data_from_remote_info (r, p_remote_info) == -1) {
             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update expired data, the ipsubnet-list remains unchanged, after remote_expire_time next update will be invoked by another request");
@@ -837,6 +850,48 @@ static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test,REMOTE_
 
         /* check if the request's ip is match one of the ipsubnets getting from url */
     return ip_in_ipsubnet_list_test (ip_to_be_test, p_remote_info -> p_ipsubnet_list);
+    
+#endif
+}
+
+/* initialize per url directive data which is not thread safe */
+/* return -1 means error */
+static int init_per_url_directive_data (request_rec *r, REMOTE_INFO *p_remote_info)
+{
+    apr_status_t rv;
+    char errmsg_buf[120];
+    auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);
+    if (!(p_remote_info -> subpool)) { /* create subpool */
+        apr_status_t rv = apr_pool_create (&(p_remote_info -> subpool), svr_conf -> subpool);
+        if (rv != APR_SUCCESS) {
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "fail to create subpool for url: %s", errmsg_buf);
+            return -1;
+        }
+    }
+    if (!(p_remote_info -> last_update_time)) { /* init last_update_time */
+        p_remote_info -> last_update_time = apr_palloc (p_remote_info -> subpool, APR_RFC822_DATE_LEN);
+        rv = apr_rfc822_date (p_remote_info -> last_update_time, 0);
+        if (rv != APR_SUCCESS) {
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to initialize last_update_time: %s", errmsg_buf);
+            return -1;
+        }
+#ifdef DEBUG
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "init_last_update_time: %s", p_remote_info -> last_update_time);
+#endif
+    }
+#if APR_HAS_THREADS
+    if (!(p_remote_info -> rwlock)) { /* create rwlock */
+        rv = apr_thread_rwlock_create (&(p_remote_info -> rwlock), svr_conf -> subpool);
+        if (rv != APR_SUCCESS) {
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to initialize rwlock: %s", errmsg_buf);
+            return -1;
+        }
+    }
+#endif
+    return 0;
 }
 
 static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr_time_t expire_time)
@@ -848,6 +903,8 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr
     int gothost = 0;
     const char *remotehost = NULL;
     char errmsg_buf[120];
+    apr_status_t rv;
+    auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);
 
     for (i = 0; i < a->nelts; ++i) {
         if (!(mmask & ap[i].limited)) {
@@ -877,6 +934,32 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr
             break;
 
         case T_URL:
+#if APR_HAS_THREADS
+            rv = apr_thread_mutex_lock (svr_conf -> mutex);
+            if (rv != APR_SUCCESS) {
+                apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to obtain mutex: %s", errmsg_buf);
+                break;
+            }
+            if (init_per_url_directive_data (r, &ap[i].x.remote_info) == -1) {
+                rv = apr_thread_mutex_unlock (svr_conf -> mutex);
+                if (rv != APR_SUCCESS) {
+                    apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to release mutex: %s", errmsg_buf);
+                    break;
+                }
+                break;
+            }
+            rv = apr_thread_mutex_unlock (svr_conf -> mutex);
+            if (rv != APR_SUCCESS) {
+                apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to release mutex: %s", errmsg_buf);
+                break;
+            }
+#else
+            if (init_per_url_directive_data (&ap[i].x.remote_info) == -1)
+                break;
+#endif
             if (ip_in_url_test (r, r->connection->remote_addr, &ap[i].x.remote_info, expire_time) == 1) {
                 return 1;
             }
@@ -975,7 +1058,7 @@ static void child_init (apr_pool_t *pchild, server_rec *s)
                       "Failed to create mutex for auth_remote_module");
         return;
     }
-#endif       
+#endif
 }
 
 static void auth_remote_hooks(apr_pool_t *p)
