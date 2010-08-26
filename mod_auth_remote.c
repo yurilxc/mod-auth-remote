@@ -44,15 +44,18 @@
 #include <stdio.h>
 #include <apr_version.h>
 #include <apr_thread_rwlock.h>
+#include <apr_file_io.h>
 #define FILE_SIZE ((17 + 1) * (20000 + 10))
 #define HEADER_SIZE (4096)
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #define CRLF_STR "\r\n"
-#define DEF_SOCK_TIMEOUT (APR_USEC_PER_SEC * 1)
+#define DEF_SOCK_TIMEOUT (APR_USEC_PER_SEC * 5)
 #define DEF_PORT_NUM 80
 #define DEF_EXPIRE_TIME 0 /* realtime*/
 #define MAX_REDIRECT_TIME 50
+#define MAX_EXPIRE_TIME 1000000000
+#define MAX_EXPIRE_TIME_STR "1000000000"
 
 enum allowdeny_type {
     T_ENV,
@@ -60,7 +63,8 @@ enum allowdeny_type {
     T_ALL,
     T_IP,
     T_HOST,
-    T_URL,                     
+    T_URL,
+    T_FILE,
     T_FAIL
 };
 
@@ -76,12 +80,25 @@ typedef struct {
 #endif
 } REMOTE_INFO;
 
+typedef struct 
+{
+    apr_time_t last_update_time;
+    char *last_update_file;
+    char *local_file;
+    apr_array_header_t *p_ipsubnet_list;/* an array including pointers to apr_ipsubnet_t */
+    apr_pool_t *subpool;
+#if APR_HAS_THREADS
+    apr_thread_rwlock_t *rwlock;
+#endif    
+} LOCAL_FILE_INFO;
+
 typedef struct {
     apr_int64_t limited;
     union {
         char *from;
         apr_ipsubnet_t *ip;
         REMOTE_INFO remote_info;
+        LOCAL_FILE_INFO local_file_info;
     } x;
     enum allowdeny_type type;
 } allowdeny;
@@ -130,7 +147,9 @@ static void *create_auth_remote_svr_config (apr_pool_t *p, server_rec *s)
     return (void *)conf;
 }
 
-static const char *order(cmd_parms *cmd, void *dv, const char *arg)
+static const char *order(cmd_parms *cmd,
+                         void *dv,
+                         const char *arg)
 {
     auth_remote_dir_conf *d = (auth_remote_dir_conf *) dv;
     int i, o;
@@ -158,8 +177,8 @@ static const char *expire_time_cmd (cmd_parms *cmd, void *dv, const char *s_expi
     apr_time_t ttime = 0;
     for (i = 0; i < len; i++) {
         if (s_expire_time[i] <= '9' && s_expire_time[i] >= '0') {
-            if (ttime > (1000000000 - (apr_time_t)(s_expire_time[i] - '0')) / 10) {
-                return "the expire time is too large (maximum: 1000000000)";
+            if (ttime > (MAX_EXPIRE_TIME - (apr_time_t)(s_expire_time[i] - '0')) / 10) {
+                return "the expire time is too large (maximum: " MAX_EXPIRE_TIME_STR ")";
             }
             ttime = ttime * 10 + (apr_time_t)(s_expire_time[i] - '0');
         }
@@ -250,6 +269,16 @@ static const char *allow_cmd(cmd_parms *cmd, void *dv, const char *from,
         a->x.remote_info.p_ipsubnet_list = NULL;
 #if APR_HAS_THREADS
         a->x.remote_info.rwlock = NULL;
+#endif
+    }
+    else if (!strncasecmp (where, "file=", 5)) {
+        a->type = T_FILE;
+        a->x.local_file_info.last_update_time = 0;
+        a->x.local_file_info.last_update_file = NULL;
+        a->x.local_file_info.local_file = where + 5;
+        a->x.local_file_info.p_ipsubnet_list = NULL;
+#if APR_HAS_THREADS
+        a->x.local_file_info.rwlock = NULL;
 #endif
     }
     else if ((s = ap_strchr(where, '/'))) {
@@ -461,7 +490,7 @@ static int get_content_length_from_header (request_rec *r, char *header, apr_siz
     return -1;    
 }
 
-/* the http-body will be store in the area file_content that point to */
+/* the http-body will be store in the area that file_content point to */
 /* redundant is starting string of file_content */
 /* expect_len is the expect len */
 static int get_body_from_response (request_rec *r, apr_socket_t *s, apr_size_t expect_len, char *redundant, apr_size_t rlen, char *body, apr_size_t *p_blen)
@@ -738,6 +767,8 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
 /*             ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_content: %s", file_content); */
 /* #endif */
 
+                /* clear the pool, preventing leakage */
+            apr_pool_clear (p_remote_info -> subpool);
                 /* update last_update_time */
             if (get_date_from_header (r, header, hlen, &ts) == -1) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "date unfound");
@@ -748,10 +779,6 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
             }
                 /* update last_update_url */
             p_remote_info -> last_update_url = apr_pstrdup (p_remote_info -> subpool, now_url);
-
-                /* clear the pool, preventing leakage */
-            apr_pool_clear (p_remote_info -> subpool);
-            
                 /* get the ipsubnet_list from file_content*/
             file_content[flen] = '\n';
             get_ipsubnet_list_from_file_content (r, p_remote_info -> subpool, file_content, flen, &(p_remote_info -> p_ipsubnet_list));
@@ -776,6 +803,118 @@ static int update_expired_data_from_remote_info (request_rec *r, REMOTE_INFO *p_
 
     ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the remote url redirects too many times, auth_remote_module stop updating data from url to prevent infinite redirection loop");
     return -1;
+}
+
+/* the file's content will be stored in the area that file_content point to */
+/* return -1 means error */
+static int get_content_from_file (request_rec *r, apr_file_t *fp, apr_finfo_t finfo, char *file_content, apr_size_t *p_flen)
+{
+    int i;
+    apr_size_t len, expect_len;
+    apr_status_t rv;
+    expect_len = finfo.size;
+    if (expect_len > FILE_SIZE)
+    {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "file size is too large");
+        return -1;
+    }
+    *p_flen = 0;
+    while (1)
+    {
+        len = expect_len - *p_flen;
+        if (len == 0)
+        {
+            char buf[1];
+            len = 1;
+            rv = apr_file_read (fp, file_content, &len);
+            if (rv == APR_EOF || len == 0) {
+                break;
+            }
+            else {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "file size is too large");
+            }
+            return -1;
+        }
+        rv = apr_file_read (fp, file_content, &len);
+        if (rv == APR_EOF || len == 0)
+            break;
+        *p_flen += len;
+        file_content += len;
+    }
+    if (*p_flen != expect_len)
+    {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to get compelte file content");
+        return -1;
+    }
+    return 0;
+}
+
+/* update expired data from infomation linked to the local file*/
+/* return 0 means OK, return -1 means ERROR */
+static int update_expired_data_from_local_file_info (
+    request_rec *r,
+    LOCAL_FILE_INFO *p_local_file_info)
+{
+    apr_size_t len;
+    char errmsg_buf[120];
+    apr_pool_t *rp = r->pool;
+    apr_status_t rv;
+    apr_file_t *fp;
+    apr_finfo_t finfo;
+    char *file_content;
+    apr_size_t flen;
+    apr_time_t cur_time = apr_time_now ();
+
+        /* open file */
+    rv = apr_file_open (&fp, p_local_file_info->local_file, APR_READ, APR_OS_DEFAULT, rp);
+    if (rv != APR_SUCCESS)
+    {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to open file: %s", errmsg_buf);
+        return -1;
+    }
+
+        /* get file info */
+    rv = apr_file_info_get(&finfo, APR_FINFO_NORM, fp);
+    if (rv != APR_SUCCESS)
+    {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to get file info: %s", errmsg_buf);
+        return -1;
+    }
+
+    if (finfo.filetype != APR_REG)
+    {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "the type of local file is not valid");
+        return -1;
+    }
+    
+        /* get the file_content*/
+    if (!(p_local_file_info -> last_update_file)
+        || strcmp (finfo.fname, p_local_file_info -> last_update_file) != 0
+        || p_local_file_info->last_update_time < finfo.mtime)
+    {
+        file_content = apr_palloc (rp, finfo.size + 2);
+        if (get_content_from_file (r, fp, finfo, file_content, &flen) == -1)
+            return -1;
+
+#ifdef DEBUG
+        file_content[flen] = '\0';
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "file_content: %s", file_content);
+#endif
+
+            /* clear the pool, preventing leakage */
+        apr_pool_clear (p_local_file_info -> subpool);
+            /* update last_update_file */
+        p_local_file_info->last_update_file = apr_pstrdup (p_local_file_info->subpool, finfo.fname);
+            /* update last_update_time */
+        p_local_file_info->last_update_time = finfo.mtime;
+            /* get the ipsubnet_list from file_content*/
+        file_content[flen] = '\n';
+        get_ipsubnet_list_from_file_content (r, p_local_file_info -> subpool, file_content, flen, &(p_local_file_info -> p_ipsubnet_list));
+    }
+    
+    return 0;
 }
 
 /* input:ip_to_be_test, p_ipsubnet_list */
@@ -809,13 +948,13 @@ static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, REMOTE
         if (rv != APR_SUCCESS) {
             apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to obtain wrlock: %s", errmsg_buf);
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update expired data, the ipsubnet-list remains unchanged, after remote_expire_time next update will be invoked by another request");
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update expired data from remote url, the ipsubnet-list remains unchanged, after remote_expire_time next update will be invoked by another request");
         }
         else {
                 /* rejudge whether it is necessary to update */
             if (apr_time_now () - p_remote_info -> last_contact_time >= expire_time) {
                 if (update_expired_data_from_remote_info (r, p_remote_info) == -1) {
-                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update expired data, the ipsubnet-list remains unchanged, after remote_expire_time next update will be invoked by another request");
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update expired data from remote url, the ipsubnet-list remains unchanged, after remote_expire_time next update will be invoked by another request");
                 }
             }
             rv = apr_thread_rwlock_unlock (p_remote_info -> rwlock);
@@ -844,7 +983,7 @@ static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, REMOTE
     if (apr_time_now () - p_remote_info -> last_contact_time >= expire_time) { /* the ip-list from url is expired */
         p_remote_info -> last_contact_time = apr_time_now ();
         if (update_expired_data_from_remote_info (r, p_remote_info) == -1) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update expired data, the ipsubnet-list remains unchanged, after remote_expire_time next update will be invoked by another request");
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update expired data from remote url, the ipsubnet-list remains unchanged, after remote_expire_time next update will be invoked by another request");
         }
     }
 
@@ -854,7 +993,53 @@ static int ip_in_url_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, REMOTE
 #endif
 }
 
-/* initialize per url directive data which is not thread safe */
+static int ip_in_local_file_test (request_rec *r, apr_sockaddr_t *ip_to_be_test, LOCAL_FILE_INFO *p_local_file_info)
+{
+    apr_status_t rv;
+    char errmsg_buf[120];
+
+#if APR_HAS_THREADS
+    rv = apr_thread_rwlock_wrlock (p_local_file_info -> rwlock);
+    if (rv != APR_SUCCESS) {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to obtain wrlock: %s", errmsg_buf);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update from local file, the ipsubnet-list remains unchanged, next update will be invoked by another request");
+    }
+    else {
+        if (update_expired_data_from_local_file_info (r, p_local_file_info) == -1) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update from local file, the ipsubnet-list remains unchanged, next update will be invoked by another request");
+        }
+        rv = apr_thread_rwlock_unlock (p_local_file_info -> rwlock);
+        if (rv != APR_SUCCESS) {
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to release wrlock: %s", errmsg_buf);
+        }
+    }
+    rv = apr_thread_rwlock_rdlock (p_local_file_info -> rwlock);
+    if (rv != APR_SUCCESS) {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to obtain rdlock: %s", errmsg_buf);
+    }
+        /* check if the request's ip is match one of the ipsubnets getting from local file */
+    int ret = ip_in_ipsubnet_list_test (ip_to_be_test, p_local_file_info -> p_ipsubnet_list);
+    rv = apr_thread_rwlock_unlock (p_local_file_info -> rwlock);
+    if (rv != APR_SUCCESS) {
+        apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to release rdlock: %s", errmsg_buf);
+    }
+    return ret;
+
+#else
+    if (update_expired_data_from_local_file_info (r, p_local_file_info) == -1) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to update from local file, the ipsubnet-list remains unchanged, next update will be invoked by another request");
+    }
+        /* check if the request's ip is match one of the ipsubnets getting from url */
+    return ip_in_ipsubnet_list_test (ip_to_be_test, p_local_file_info -> p_ipsubnet_list);
+    
+#endif
+}
+
+/* initialize per local file directive data which is not thread safe */
 /* return -1 means error */
 static int init_per_url_directive_data (request_rec *r, REMOTE_INFO *p_remote_info)
 {
@@ -886,7 +1071,35 @@ static int init_per_url_directive_data (request_rec *r, REMOTE_INFO *p_remote_in
         rv = apr_thread_rwlock_create (&(p_remote_info -> rwlock), svr_conf -> subpool);
         if (rv != APR_SUCCESS) {
             apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to initialize rwlock: %s", errmsg_buf);
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to initialize rwlock for url : %s", errmsg_buf);
+            return -1;
+        }
+    }
+#endif
+    return 0;
+}
+
+/* initialize per local file directive data which is not thread safe */
+/* return -1 means error */
+static int init_per_local_file_directive_data (request_rec *r, LOCAL_FILE_INFO *p_local_file_info)
+{
+    apr_status_t rv;
+    char errmsg_buf[120];
+    auth_remote_svr_conf *svr_conf = ap_get_module_config(r->server->module_config, &auth_remote_module);
+    if (!(p_local_file_info -> subpool)) { /* create subpool */
+        apr_status_t rv = apr_pool_create (&(p_local_file_info -> subpool), svr_conf -> subpool);
+        if (rv != APR_SUCCESS) {
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "fail to create subpool for local file: %s", errmsg_buf);
+            return -1;
+        }
+    }
+#if APR_HAS_THREADS
+    if (!(p_local_file_info -> rwlock)) { /* create rwlock */
+        rv = apr_thread_rwlock_create (&(p_local_file_info -> rwlock), svr_conf -> subpool);
+        if (rv != APR_SUCCESS) {
+            apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to initialize rwlock for local file: %s", errmsg_buf);
             return -1;
         }
     }
@@ -933,7 +1146,7 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr
             }
             break;
 
-        case T_URL:
+            case T_URL:
 #if APR_HAS_THREADS
             rv = apr_thread_mutex_lock (svr_conf -> mutex);
             if (rv != APR_SUCCESS) {
@@ -961,6 +1174,38 @@ static int find_allowdeny(request_rec *r, apr_array_header_t *a, int method, apr
                 break;
 #endif
             if (ip_in_url_test (r, r->connection->remote_addr, &ap[i].x.remote_info, expire_time) == 1) {
+                return 1;
+            }
+            break;
+
+        case T_FILE:
+#if APR_HAS_THREADS
+            rv = apr_thread_mutex_lock (svr_conf -> mutex);
+            if (rv != APR_SUCCESS) {
+                apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to obtain mutex: %s", errmsg_buf);
+                break;
+            }
+            if (init_per_local_file_directive_data (r, &ap[i].x.local_file_info) == -1) {
+                rv = apr_thread_mutex_unlock (svr_conf -> mutex);
+                if (rv != APR_SUCCESS) {
+                    apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to release mutex: %s", errmsg_buf);
+                    break;
+                }
+                break;
+            }
+            rv = apr_thread_mutex_unlock (svr_conf -> mutex);
+            if (rv != APR_SUCCESS) {
+                apr_strerror (rv, errmsg_buf, sizeof (errmsg_buf));
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "fail to release mutex: %s", errmsg_buf);
+                break;
+            }
+#else
+            if (init_per_local_file_directive_data (&ap[i].x.local_file_info) == -1)
+                break;
+#endif
+            if (ip_in_local_file_test (r, r->connection->remote_addr, &ap[i].x.local_file_info) == 1) {
                 return 1;
             }
             break;
