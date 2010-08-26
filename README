@@ -24,7 +24,7 @@ remote_allow
 remote_deny
 remote_expire_time
 
-a)remote_order, remote_allow, remote_deny使用方法和与Apache默认的指令order，allow，deny分别对应，可兼容order，allow，deny支持的功能，唯一不同的是remote_allow和remote_deny增加了如下功能：
+a)remote_order, remote_allow, remote_deny使用方法和与Apache默认的指令order，allow，deny分别对应，可兼容order，allow，deny支持的功能，不同的是remote_allow和remote_deny增加了如下功能：
 remote_allow from url=url_name
 url_name是一个合法的url，提供一个ip地址列表。
 模块判断当前request的ip地址是否在url提供的ip列表中，如果在列表中，对remote_allow来说表示允许访问，对remote_deny则表示不允许访问，实际最终判断结果要结合remote_order来判断，判断规则与默认的指令中order指令一样。
