@@ -1,8 +1,8 @@
 APACHE_ROOT=/usr/local/apache2
 MODULE_NAME=mod_auth_remote
 
-all:$(MODULE_NAME).c
-	$(APACHE_ROOT)/bin/apxs -c $(MODULE_NAME).c
+all:$(MODULE_NAME).c $(MODULE_NAME).h
+	$(APACHE_ROOT)/bin/apxs -c $(MODULE_NAME).c $(MODULE_NAME).h
 
 #load the module into apache's /module directory
 .PHONY:install
