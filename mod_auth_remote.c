@@ -164,7 +164,7 @@ static const char *allow_cmd (cmd_parms *cmd, void *dv, const char *from,
     else if (!strcasecmp(where, "all")) {
         a->type = T_ALL;
     }
-    if (!strncasecmp (where, "uri=", 4)) {
+    else if (!strncasecmp (where, "uri=", 4)) {
         if (!strncasecmp (where, "uri=file://", 11)) {
             a->type = T_FILE;
             a->x.local_file_info.last_update_time = 0;
